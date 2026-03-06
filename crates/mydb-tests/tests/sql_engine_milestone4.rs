@@ -263,3 +263,191 @@ fn sql_engine_join_group_and_aggregate() {
 
     cleanup_dir(&dir);
 }
+
+#[test]
+fn sql_engine_multi_database_isolation_and_switching() {
+    let dir = unique_test_dir("sql-engine-multidb");
+    let base = dir.join("mydb");
+    let engine = Engine::new(&base);
+
+    engine.execute_sql("CREATE DATABASE app1").unwrap();
+    engine.execute_sql("CREATE DATABASE app2").unwrap();
+
+    let shown = engine.execute_sql("SHOW DATABASES").unwrap();
+    assert_eq!(
+        shown,
+        QueryResult::Rows {
+            columns: vec!["database".to_string()],
+            rows: vec![
+                vec![Value::Varchar("app1".to_string())],
+                vec![Value::Varchar("app2".to_string())],
+                vec![Value::Varchar("default".to_string())],
+            ],
+        }
+    );
+    let current_default = engine.execute_sql("SHOW CURRENT DATABASE").unwrap();
+    assert_eq!(
+        current_default,
+        QueryResult::Rows {
+            columns: vec!["database".to_string()],
+            rows: vec![vec![Value::Varchar("default".to_string())]],
+        }
+    );
+
+    engine.execute_sql("USE app1").unwrap();
+    let current_app1 = engine.execute_sql("SHOW CURRENT DATABASE").unwrap();
+    assert_eq!(
+        current_app1,
+        QueryResult::Rows {
+            columns: vec!["database".to_string()],
+            rows: vec![vec![Value::Varchar("app1".to_string())]],
+        }
+    );
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, name) VALUES (1, 'a1')")
+        .unwrap();
+
+    engine.execute_sql("USE app2").unwrap();
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, name) VALUES (1, 'a2')")
+        .unwrap();
+
+    let app2_rows = engine.execute_sql("SELECT id, name FROM t").unwrap();
+    assert_eq!(
+        app2_rows,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("a2".to_string())]],
+        }
+    );
+
+    engine.execute_sql("USE app1").unwrap();
+    let app1_rows = engine.execute_sql("SELECT id, name FROM t").unwrap();
+    assert_eq!(
+        app1_rows,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("a1".to_string())]],
+        }
+    );
+    let app1_tables = engine.execute_sql("SHOW TABLES").unwrap();
+    assert_eq!(
+        app1_tables,
+        QueryResult::Rows {
+            columns: vec!["table_id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("t".to_string())]],
+        }
+    );
+
+    engine.execute_sql("USE app2").unwrap();
+    let app2_tables = engine.execute_sql("SHOW TABLES").unwrap();
+    assert_eq!(
+        app2_tables,
+        QueryResult::Rows {
+            columns: vec!["table_id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("t".to_string())]],
+        }
+    );
+    engine.execute_sql("DROP TABLE t").unwrap();
+    let app2_tables_after_drop = engine.execute_sql("SHOW TABLES").unwrap();
+    assert_eq!(
+        app2_tables_after_drop,
+        QueryResult::Rows {
+            columns: vec!["table_id".to_string(), "name".to_string()],
+            rows: vec![],
+        }
+    );
+    let select_after_drop = engine.execute_sql("SELECT id, name FROM t").unwrap_err();
+    assert!(
+        select_after_drop
+            .to_string()
+            .contains("table 't' not found")
+    );
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, name) VALUES (2, 'a2-recreated')")
+        .unwrap();
+    let app2_rows_after_recreate = engine.execute_sql("SELECT id, name FROM t").unwrap();
+    assert_eq!(
+        app2_rows_after_recreate,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![
+                Value::BigInt(2),
+                Value::Varchar("a2-recreated".to_string())
+            ]],
+        }
+    );
+
+    let missing = engine.execute_sql("USE missing").unwrap_err();
+    assert!(missing.to_string().contains("database 'missing' not found"));
+
+    engine.execute_sql("BEGIN").unwrap();
+    let switch_in_tx = engine.execute_sql("USE app2").unwrap_err();
+    assert!(
+        switch_in_tx
+            .to_string()
+            .contains("cannot switch database while a transaction is active")
+    );
+    let drop_in_tx = engine.execute_sql("DROP DATABASE app1").unwrap_err();
+    assert!(
+        drop_in_tx
+            .to_string()
+            .contains("cannot drop database while a transaction is active")
+    );
+    engine.execute_sql("ROLLBACK").unwrap();
+
+    engine.execute_sql("USE default").unwrap();
+    let default_tables = engine.execute_sql("SHOW TABLES").unwrap();
+    assert_eq!(
+        default_tables,
+        QueryResult::Rows {
+            columns: vec!["table_id".to_string(), "name".to_string()],
+            rows: vec![],
+        }
+    );
+
+    engine.execute_sql("DROP DATABASE app2").unwrap();
+    let shown_after_drop = engine.execute_sql("SHOW DATABASES").unwrap();
+    assert_eq!(
+        shown_after_drop,
+        QueryResult::Rows {
+            columns: vec!["database".to_string()],
+            rows: vec![
+                vec![Value::Varchar("app1".to_string())],
+                vec![Value::Varchar("default".to_string())],
+            ],
+        }
+    );
+    let use_dropped = engine.execute_sql("USE app2").unwrap_err();
+    assert!(
+        use_dropped
+            .to_string()
+            .contains("database 'app2' not found")
+    );
+
+    let drop_default = engine.execute_sql("DROP DATABASE default").unwrap_err();
+    assert!(
+        drop_default
+            .to_string()
+            .contains("cannot drop default database")
+    );
+
+    engine.execute_sql("USE app1").unwrap();
+    let drop_current = engine.execute_sql("DROP DATABASE app1").unwrap_err();
+    assert!(
+        drop_current
+            .to_string()
+            .contains("cannot drop database currently in use")
+    );
+
+    cleanup_dir(&dir);
+}

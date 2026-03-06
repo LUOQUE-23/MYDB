@@ -38,9 +38,16 @@ pub enum TokenKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Create,
+    Drop,
     Begin,
     Commit,
     Rollback,
+    Database,
+    Databases,
+    Tables,
+    Current,
+    Use,
+    Show,
     Index,
     On,
     Table,
@@ -234,9 +241,16 @@ fn keyword_of(text: &str) -> Option<Keyword> {
     let upper = text.to_ascii_uppercase();
     match upper.as_str() {
         "CREATE" => Some(Keyword::Create),
+        "DROP" => Some(Keyword::Drop),
         "BEGIN" => Some(Keyword::Begin),
         "COMMIT" => Some(Keyword::Commit),
         "ROLLBACK" => Some(Keyword::Rollback),
+        "DATABASE" => Some(Keyword::Database),
+        "DATABASES" => Some(Keyword::Databases),
+        "TABLES" => Some(Keyword::Tables),
+        "CURRENT" => Some(Keyword::Current),
+        "USE" => Some(Keyword::Use),
+        "SHOW" => Some(Keyword::Show),
         "INDEX" => Some(Keyword::Index),
         "ON" => Some(Keyword::On),
         "TABLE" => Some(Keyword::Table),

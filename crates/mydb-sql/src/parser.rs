@@ -41,7 +41,10 @@ impl<'a> Parser<'a> {
                 self.expect_keyword(Keyword::Rollback)?;
                 Statement::Rollback
             }
+            Some(Keyword::Use) => self.parse_use()?,
+            Some(Keyword::Show) => self.parse_show()?,
             Some(Keyword::Create) => self.parse_create()?,
+            Some(Keyword::Drop) => self.parse_drop()?,
             Some(Keyword::Insert) => self.parse_insert()?,
             Some(Keyword::Select) => self.parse_select()?,
             Some(Keyword::Delete) => self.parse_delete()?,
@@ -61,7 +64,61 @@ impl<'a> Parser<'a> {
         match self.peek_keyword() {
             Some(Keyword::Table) => self.parse_create_table(),
             Some(Keyword::Index) => self.parse_create_index(),
-            _ => Err(self.error_here("expected TABLE or INDEX after CREATE")),
+            Some(Keyword::Database) => self.parse_create_database(),
+            _ => Err(self.error_here("expected TABLE, INDEX or DATABASE after CREATE")),
+        }
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Drop)?;
+        match self.peek_keyword() {
+            Some(Keyword::Database) => self.parse_drop_database(),
+            Some(Keyword::Table) => self.parse_drop_table(),
+            _ => Err(self.error_here("expected DATABASE or TABLE after DROP")),
+        }
+    }
+
+    fn parse_create_database(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Database)?;
+        let name = self.parse_identifier_path_segment()?;
+        Ok(Statement::CreateDatabase { name })
+    }
+
+    fn parse_drop_database(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Database)?;
+        let name = self.parse_identifier_path_segment()?;
+        Ok(Statement::DropDatabase { name })
+    }
+
+    fn parse_drop_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Table)?;
+        let name = self.parse_identifier_path()?;
+        Ok(Statement::DropTable { name })
+    }
+
+    fn parse_use(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Use)?;
+        let name = self.parse_identifier_path_segment()?;
+        Ok(Statement::UseDatabase { name })
+    }
+
+    fn parse_show(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Show)?;
+        match self.peek_keyword() {
+            Some(Keyword::Databases) => {
+                self.expect_keyword(Keyword::Databases)?;
+                Ok(Statement::ShowDatabases)
+            }
+            Some(Keyword::Tables) => {
+                self.expect_keyword(Keyword::Tables)?;
+                Ok(Statement::ShowTables)
+            }
+            Some(Keyword::Current) => {
+                self.expect_keyword(Keyword::Current)?;
+                self.expect_keyword(Keyword::Database)?;
+                Ok(Statement::ShowCurrentDatabase)
+            }
+            _ => Err(self.error_here("expected DATABASES, TABLES, or CURRENT DATABASE after SHOW")),
         }
     }
 

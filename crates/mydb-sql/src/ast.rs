@@ -5,6 +5,21 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    CreateDatabase {
+        name: String,
+    },
+    DropDatabase {
+        name: String,
+    },
+    UseDatabase {
+        name: String,
+    },
+    ShowDatabases,
+    ShowCurrentDatabase,
+    ShowTables,
+    DropTable {
+        name: String,
+    },
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,

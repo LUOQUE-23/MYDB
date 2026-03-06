@@ -28,6 +28,8 @@ pub trait Executor {
     fn execute_sql(&self, sql: &str) -> Result<QueryResult>;
 }
 
+const DEFAULT_DATABASE_NAME: &str = "default";
+
 #[derive(Debug, Clone)]
 pub struct Engine {
     catalog_base: PathBuf,
@@ -39,11 +41,13 @@ struct EngineState {
     tx: Option<TransactionContext>,
     wal_recovered: bool,
     next_tx_id: u64,
+    current_db: String,
 }
 
 #[derive(Debug, Clone)]
 struct TransactionContext {
     tx_id: u64,
+    live_base: PathBuf,
     working_base: PathBuf,
 }
 
@@ -98,6 +102,7 @@ impl Engine {
                 tx: None,
                 wal_recovered: false,
                 next_tx_id: now_nanos.max(1),
+                current_db: DEFAULT_DATABASE_NAME.to_string(),
             })),
         }
     }
@@ -108,6 +113,12 @@ impl Engine {
             Statement::Begin => self.begin_transaction(),
             Statement::Commit => self.commit_transaction(),
             Statement::Rollback => self.rollback_transaction(),
+            Statement::CreateDatabase { name } => self.create_database(&name),
+            Statement::DropDatabase { name } => self.drop_database(&name),
+            Statement::UseDatabase { name } => self.use_database(&name),
+            Statement::ShowDatabases => self.show_databases(),
+            Statement::ShowCurrentDatabase => self.show_current_database(),
+            Statement::ShowTables => self.show_tables(),
             other => self.execute_regular_statement(other),
         }
     }
@@ -121,6 +132,7 @@ impl Engine {
             return self.execute_statement_on_base(&base, statement);
         }
 
+        let live_base = self.current_live_base()?;
         if is_mutating_statement(&statement) {
             self.begin_transaction_internal()?;
             let execution = {
@@ -138,7 +150,7 @@ impl Engine {
                 }
             }
         } else {
-            self.execute_statement_on_base(&self.catalog_base, statement)
+            self.execute_statement_on_base(&live_base, statement)
         }
     }
 
@@ -151,6 +163,7 @@ impl Engine {
             Statement::CreateTable { name, columns } => {
                 self.exec_create_table(catalog_base, &name, columns)
             }
+            Statement::DropTable { name } => self.exec_drop_table(catalog_base, &name),
             Statement::CreateIndex {
                 name,
                 table,
@@ -189,8 +202,16 @@ impl Engine {
                 assignments,
                 selection,
             } => self.exec_update(catalog_base, &table, assignments, selection),
-            Statement::Begin | Statement::Commit | Statement::Rollback => Err(MyDbError::Parse(
-                "transaction control statement not expected here".to_string(),
+            Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
+            | Statement::UseDatabase { .. }
+            | Statement::ShowDatabases
+            | Statement::ShowCurrentDatabase
+            | Statement::ShowTables => Err(MyDbError::Parse(
+                "statement not expected in this execution path".to_string(),
             )),
         }
     }
@@ -212,6 +233,28 @@ impl Engine {
         Ok(QueryResult::Message(format!(
             "created table '{}' (id={})",
             table.name, table.table_id
+        )))
+    }
+
+    fn exec_drop_table(&self, catalog_base: &Path, table_name: &str) -> Result<QueryResult> {
+        let mut catalog = Catalog::open(catalog_base)?;
+        let table = find_table(&catalog, table_name)?;
+        let indexes = catalog.list_indexes(table_name)?;
+        catalog.drop_table(table_name)?;
+
+        let heap_path = table_heap_path(catalog_base, table.table_id);
+        if heap_path.exists() {
+            fs::remove_file(heap_path)?;
+        }
+        for index in indexes {
+            let index_path = index_file_path(catalog_base, index.index_id);
+            if index_path.exists() {
+                fs::remove_file(index_path)?;
+            }
+        }
+        Ok(QueryResult::Message(format!(
+            "dropped table '{}'",
+            table_name
         )))
     }
 
@@ -499,6 +542,135 @@ impl Engine {
         Ok(QueryResult::AffectedRows(updated))
     }
 
+    fn create_database(&self, db_name: &str) -> Result<QueryResult> {
+        let normalized = normalize_database_name(db_name)?;
+        let mut databases = self.load_database_registry()?;
+        if databases.iter().any(|name| name == &normalized) {
+            return Err(MyDbError::AlreadyExists {
+                object: "database".to_string(),
+                name: db_name.to_string(),
+            });
+        }
+        databases.push(normalized.clone());
+        databases.sort();
+        persist_database_registry(&self.catalog_base, &databases)?;
+
+        let db_base = self.database_base_for_name(&normalized)?;
+        let _ = Catalog::open(&db_base)?;
+        clear_wal(&db_base)?;
+        Ok(QueryResult::Message(format!(
+            "created database '{}'",
+            normalized
+        )))
+    }
+
+    fn drop_database(&self, db_name: &str) -> Result<QueryResult> {
+        let normalized = normalize_database_name(db_name)?;
+        if normalized == DEFAULT_DATABASE_NAME {
+            return Err(MyDbError::Parse("cannot drop default database".to_string()));
+        }
+        {
+            let state = self.lock_state()?;
+            if state.tx.is_some() {
+                return Err(MyDbError::Parse(
+                    "cannot drop database while a transaction is active".to_string(),
+                ));
+            }
+            if state.current_db == normalized {
+                return Err(MyDbError::Parse(
+                    "cannot drop database currently in use; switch to another database first"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let mut databases = self.load_database_registry()?;
+        if !databases.iter().any(|name| name == &normalized) {
+            return Err(MyDbError::NotFound {
+                object: "database".to_string(),
+                name: db_name.to_string(),
+            });
+        }
+
+        let db_base = self.database_base_for_name(&normalized)?;
+        cleanup_family_files_for_base(&db_base)?;
+        databases.retain(|name| name != &normalized);
+        persist_database_registry(&self.catalog_base, &databases)?;
+        Ok(QueryResult::Message(format!(
+            "dropped database '{}'",
+            normalized
+        )))
+    }
+
+    fn use_database(&self, db_name: &str) -> Result<QueryResult> {
+        let normalized = normalize_database_name(db_name)?;
+        {
+            let state = self.lock_state()?;
+            if state.tx.is_some() {
+                return Err(MyDbError::Parse(
+                    "cannot switch database while a transaction is active".to_string(),
+                ));
+            }
+        }
+
+        let databases = self.load_database_registry()?;
+        if !databases.iter().any(|name| name == &normalized) {
+            return Err(MyDbError::NotFound {
+                object: "database".to_string(),
+                name: db_name.to_string(),
+            });
+        }
+
+        let mut state = self.lock_state()?;
+        state.current_db = normalized.clone();
+        Ok(QueryResult::Message(format!(
+            "using database '{}'",
+            normalized
+        )))
+    }
+
+    fn show_databases(&self) -> Result<QueryResult> {
+        let databases = self.load_database_registry()?;
+        let rows = databases
+            .into_iter()
+            .map(|name| vec![Value::Varchar(name)])
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: vec!["database".to_string()],
+            rows,
+        })
+    }
+
+    fn show_current_database(&self) -> Result<QueryResult> {
+        let current_db = {
+            let state = self.lock_state()?;
+            state.current_db.clone()
+        };
+        Ok(QueryResult::Rows {
+            columns: vec!["database".to_string()],
+            rows: vec![vec![Value::Varchar(current_db)]],
+        })
+    }
+
+    fn show_tables(&self) -> Result<QueryResult> {
+        let live_base = self.current_live_base()?;
+        let catalog = Catalog::open(live_base)?;
+        let rows = catalog
+            .list_tables()
+            .into_iter()
+            .map(|table| {
+                vec![
+                    Value::BigInt(i64::from(table.table_id)),
+                    Value::Varchar(table.name),
+                ]
+            })
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: vec!["table_id".to_string(), "name".to_string()],
+            rows,
+        })
+    }
+
     fn begin_transaction(&self) -> Result<QueryResult> {
         self.begin_transaction_internal()?;
         Ok(QueryResult::Message("transaction started".to_string()))
@@ -529,14 +701,16 @@ impl Engine {
             state.next_tx_id = state.next_tx_id.saturating_add(1);
             state.next_tx_id
         };
-        let tx_base = tx_base_path(&self.catalog_base, tx_id);
+        let live_base = self.current_live_base()?;
+        let tx_base = tx_base_path(&live_base, tx_id);
         cleanup_family_files_for_base(&tx_base)?;
-        copy_live_files_to_tx(&self.catalog_base, &tx_base)?;
-        write_wal_reset(&self.catalog_base, WalEventKind::Begin, tx_id)?;
+        copy_live_files_to_tx(&live_base, &tx_base)?;
+        write_wal_reset(&live_base, WalEventKind::Begin, tx_id)?;
 
         let mut state = self.lock_state()?;
         state.tx = Some(TransactionContext {
             tx_id,
+            live_base,
             working_base: tx_base,
         });
         Ok(())
@@ -551,11 +725,11 @@ impl Engine {
                 .ok_or(MyDbError::Parse("no active transaction".to_string()))?
         };
 
-        write_wal_append(&self.catalog_base, WalEventKind::CommitStart, tx.tx_id)?;
-        apply_tx_files_to_live(&self.catalog_base, &tx.working_base)?;
-        write_wal_append(&self.catalog_base, WalEventKind::CommitDone, tx.tx_id)?;
+        write_wal_append(&tx.live_base, WalEventKind::CommitStart, tx.tx_id)?;
+        apply_tx_files_to_live(&tx.live_base, &tx.working_base)?;
+        write_wal_append(&tx.live_base, WalEventKind::CommitDone, tx.tx_id)?;
         cleanup_family_files_for_base(&tx.working_base)?;
-        clear_wal(&self.catalog_base)?;
+        clear_wal(&tx.live_base)?;
 
         let mut state = self.lock_state()?;
         state.tx = None;
@@ -571,7 +745,7 @@ impl Engine {
                 .ok_or(MyDbError::Parse("no active transaction".to_string()))?
         };
         cleanup_family_files_for_base(&tx.working_base)?;
-        clear_wal(&self.catalog_base)?;
+        clear_wal(&tx.live_base)?;
         let mut state = self.lock_state()?;
         state.tx = None;
         Ok(())
@@ -584,7 +758,11 @@ impl Engine {
                 return Ok(());
             }
         }
-        recover_from_wal(&self.catalog_base)?;
+        let databases = self.load_database_registry()?;
+        for name in databases {
+            let base = self.database_base_for_name(&name)?;
+            recover_from_wal(&base)?;
+        }
         let mut state = self.lock_state()?;
         state.wal_recovered = true;
         Ok(())
@@ -597,6 +775,26 @@ impl Engine {
             .as_ref()
             .map(|tx| tx.working_base.clone())
             .ok_or(MyDbError::Parse("no active transaction".to_string()))
+    }
+
+    fn current_live_base(&self) -> Result<PathBuf> {
+        let current_db = {
+            let state = self.lock_state()?;
+            state.current_db.clone()
+        };
+        self.database_base_for_name(&current_db)
+    }
+
+    fn database_base_for_name(&self, db_name: &str) -> Result<PathBuf> {
+        if db_name == DEFAULT_DATABASE_NAME {
+            return Ok(self.catalog_base.clone());
+        }
+        let (dir, prefix) = family_dir_and_prefix(&self.catalog_base)?;
+        Ok(dir.join(format!("{prefix}-db-{db_name}")))
+    }
+
+    fn load_database_registry(&self) -> Result<Vec<String>> {
+        load_or_init_database_registry(&self.catalog_base)
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, EngineState>> {
@@ -617,6 +815,7 @@ fn is_mutating_statement(statement: &Statement) -> bool {
     matches!(
         statement,
         Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
             | Statement::CreateIndex { .. }
             | Statement::Insert { .. }
             | Statement::Delete { .. }
@@ -624,8 +823,80 @@ fn is_mutating_statement(statement: &Statement) -> bool {
     )
 }
 
+fn normalize_database_name(name: &str) -> Result<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(MyDbError::Parse(
+            "database name cannot be empty".to_string(),
+        ));
+    }
+    let mut chars = normalized.chars();
+    let Some(first) = chars.next() else {
+        return Err(MyDbError::Parse(
+            "database name cannot be empty".to_string(),
+        ));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(MyDbError::Parse(format!(
+            "invalid database name '{}': must start with a letter or underscore",
+            name
+        )));
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return Err(MyDbError::Parse(format!(
+            "invalid database name '{}': only letters, digits and underscore are allowed",
+            name
+        )));
+    }
+    Ok(normalized)
+}
+
+fn databases_manifest_path(base: &Path) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(".databases");
+    PathBuf::from(os)
+}
+
+fn load_or_init_database_registry(base: &Path) -> Result<Vec<String>> {
+    let manifest = databases_manifest_path(base);
+    let mut databases = Vec::new();
+    if manifest.exists() {
+        let content = fs::read_to_string(&manifest)?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let normalized = normalize_database_name(trimmed)?;
+            if !databases.iter().any(|name| name == &normalized) {
+                databases.push(normalized);
+            }
+        }
+    }
+
+    if !databases.iter().any(|name| name == DEFAULT_DATABASE_NAME) {
+        databases.push(DEFAULT_DATABASE_NAME.to_string());
+    }
+    databases.sort();
+    persist_database_registry(base, &databases)?;
+    Ok(databases)
+}
+
+fn persist_database_registry(base: &Path, databases: &[String]) -> Result<()> {
+    let manifest = databases_manifest_path(base);
+    let content = if databases.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", databases.join("\n"))
+    };
+    fs::write(manifest, content)?;
+    Ok(())
+}
+
 fn wal_path(base: &Path) -> PathBuf {
-    base.with_extension("wal")
+    let mut os = base.as_os_str().to_os_string();
+    os.push(".wal");
+    PathBuf::from(os)
 }
 
 fn tx_base_path(base: &Path, tx_id: u64) -> PathBuf {

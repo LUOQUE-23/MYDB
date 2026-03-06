@@ -246,4 +246,41 @@ mod tests {
         assert_eq!(parse_sql("COMMIT;").unwrap(), Statement::Commit);
         assert_eq!(parse_sql("ROLLBACK").unwrap(), Statement::Rollback);
     }
+
+    #[test]
+    fn parse_database_statements() {
+        assert_eq!(
+            parse_sql("CREATE DATABASE appdb").unwrap(),
+            Statement::CreateDatabase {
+                name: "appdb".to_string()
+            }
+        );
+        assert_eq!(
+            parse_sql("DROP DATABASE appdb").unwrap(),
+            Statement::DropDatabase {
+                name: "appdb".to_string()
+            }
+        );
+        assert_eq!(
+            parse_sql("USE appdb;").unwrap(),
+            Statement::UseDatabase {
+                name: "appdb".to_string()
+            }
+        );
+        assert_eq!(
+            parse_sql("SHOW DATABASES").unwrap(),
+            Statement::ShowDatabases
+        );
+        assert_eq!(parse_sql("SHOW TABLES").unwrap(), Statement::ShowTables);
+        assert_eq!(
+            parse_sql("SHOW CURRENT DATABASE").unwrap(),
+            Statement::ShowCurrentDatabase
+        );
+        assert_eq!(
+            parse_sql("DROP TABLE users").unwrap(),
+            Statement::DropTable {
+                name: "users".to_string()
+            }
+        );
+    }
 }
