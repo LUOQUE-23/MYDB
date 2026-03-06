@@ -1,0 +1,265 @@
+use std::path::{Path, PathBuf};
+use std::{fs, thread, time};
+
+use mydb_core::Value;
+use mydb_exec::{Engine, Executor, QueryResult};
+
+fn unique_test_dir(name: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let tick = time::SystemTime::now()
+        .duration_since(time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("mydb-{name}-{}-{tick}", std::process::id()));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn cleanup_dir(path: &Path) {
+    for _ in 0..5 {
+        if fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        thread::sleep(time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn sql_engine_create_insert_select_delete() {
+    let dir = unique_test_dir("sql-engine");
+    let base = dir.join("mydb");
+    let engine = Engine::new(&base);
+
+    let create = engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR, active BOOL)")
+        .unwrap();
+    assert!(matches!(create, QueryResult::Message(_)));
+
+    let inserted = engine
+        .execute_sql(
+            "INSERT INTO users (id, name, active) VALUES (1, 'alice', true), (2, 'bob', false)",
+        )
+        .unwrap();
+    assert_eq!(inserted, QueryResult::AffectedRows(2));
+
+    let create_index = engine
+        .execute_sql("CREATE INDEX idx_users_id ON users (id)")
+        .unwrap();
+    assert!(matches!(create_index, QueryResult::Message(_)));
+
+    let sorted_limited = engine
+        .execute_sql("SELECT id, name FROM users ORDER BY id DESC LIMIT 1")
+        .unwrap();
+    assert_eq!(
+        sorted_limited,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(2), Value::Varchar("bob".to_string())]]
+        }
+    );
+
+    let selected = engine
+        .execute_sql("SELECT id, name FROM users WHERE active = true")
+        .unwrap();
+    assert_eq!(
+        selected,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("alice".to_string())]]
+        }
+    );
+
+    let deleted = engine
+        .execute_sql("DELETE FROM users WHERE id = 2")
+        .unwrap();
+    assert_eq!(deleted, QueryResult::AffectedRows(1));
+
+    let selected_eq = engine
+        .execute_sql("SELECT id, name FROM users WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        selected_eq,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("alice".to_string())]]
+        }
+    );
+
+    let selected_after_delete = engine.execute_sql("SELECT * FROM users").unwrap();
+    assert_eq!(
+        selected_after_delete,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
+            rows: vec![vec![
+                Value::BigInt(1),
+                Value::Varchar("alice".to_string()),
+                Value::Bool(true)
+            ]]
+        }
+    );
+
+    let updated = engine
+        .execute_sql("UPDATE users SET id = 10, name = 'alice-10' WHERE id = 1")
+        .unwrap();
+    assert_eq!(updated, QueryResult::AffectedRows(1));
+
+    let selected_new_id = engine
+        .execute_sql("SELECT id, name FROM users WHERE id = 10")
+        .unwrap();
+    assert_eq!(
+        selected_new_id,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![
+                Value::BigInt(10),
+                Value::Varchar("alice-10".to_string())
+            ]]
+        }
+    );
+
+    let selected_old_id = engine
+        .execute_sql("SELECT id, name FROM users WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        selected_old_id,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![]
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_transaction_commit_rollback_and_recovery() {
+    let dir = unique_test_dir("sql-engine-tx");
+    let base = dir.join("mydb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+
+    let begin = engine.execute_sql("BEGIN").unwrap();
+    assert!(matches!(begin, QueryResult::Message(_)));
+    engine
+        .execute_sql("INSERT INTO t (id, name) VALUES (1, 'tx-rollback')")
+        .unwrap();
+    let rollback = engine.execute_sql("ROLLBACK").unwrap();
+    assert!(matches!(rollback, QueryResult::Message(_)));
+
+    let after_rollback = engine.execute_sql("SELECT * FROM t").unwrap();
+    assert_eq!(
+        after_rollback,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![],
+        }
+    );
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, name) VALUES (1, 'tx-commit')")
+        .unwrap();
+    let commit = engine.execute_sql("COMMIT").unwrap();
+    assert!(matches!(commit, QueryResult::Message(_)));
+
+    let after_commit = engine.execute_sql("SELECT id, name FROM t").unwrap();
+    assert_eq!(
+        after_commit,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![
+                Value::BigInt(1),
+                Value::Varchar("tx-commit".to_string())
+            ]],
+        }
+    );
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, name) VALUES (2, 'crash-like')")
+        .unwrap();
+    drop(engine);
+
+    let recovered_engine = Engine::new(&base);
+    let recovered_rows = recovered_engine
+        .execute_sql("SELECT id, name FROM t ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        recovered_rows,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![
+                Value::BigInt(1),
+                Value::Varchar("tx-commit".to_string())
+            ]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_join_group_and_aggregate() {
+    let dir = unique_test_dir("sql-engine-join-group");
+    let base = dir.join("mydb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql(
+            "CREATE TABLE orders (id BIGINT NOT NULL, user_id BIGINT NOT NULL, amount BIGINT)",
+        )
+        .unwrap();
+
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 10), (2, 1, 30), (3, 2, 5)",
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql(
+            "SELECT users.id, COUNT(*), SUM(orders.amount), MIN(orders.amount), MAX(orders.amount) \
+             FROM users JOIN orders ON users.id = orders.user_id \
+             GROUP BY users.id ORDER BY users.id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        QueryResult::Rows {
+            columns: vec![
+                "users.id".to_string(),
+                "count(*)".to_string(),
+                "sum(orders.amount)".to_string(),
+                "min(orders.amount)".to_string(),
+                "max(orders.amount)".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    Value::BigInt(1),
+                    Value::BigInt(2),
+                    Value::Double(40.0),
+                    Value::BigInt(10),
+                    Value::BigInt(30),
+                ],
+                vec![
+                    Value::BigInt(2),
+                    Value::BigInt(1),
+                    Value::Double(5.0),
+                    Value::BigInt(5),
+                    Value::BigInt(5),
+                ],
+            ],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
