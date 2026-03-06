@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/mydb-core",
+    "crates/mydb-storage",
+    "crates/mydb-sql",
+    "crates/mydb-exec",
+    "crates/mydb-server",
+    "crates/mydb-tests",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["mydb"]
+rust-version = "1.85"
