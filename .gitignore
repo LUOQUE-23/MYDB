@@ -1,2 +1,17 @@
 /target
 Cargo.lock
+
+# local runtime data / instances
+/mydb-instance/
+/tmp/
+/mydb.columns
+/mydb.indexes
+/mydb.tables
+
+# storage engine artifacts
+*.columns
+*.indexes
+*.tables
+*.wal
+*.heap
+*.idx
