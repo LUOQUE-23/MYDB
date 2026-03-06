@@ -66,6 +66,8 @@
 
 在项目根目录执行：
 
+#### Windows（PowerShell）
+
 ```powershell
 cargo install --path crates/mydb-server --force
 ```
@@ -76,16 +78,42 @@ cargo install --path crates/mydb-server --force
 mydb --version
 ```
 
+#### macOS / Linux（bash 或 zsh）
+
+```bash
+cargo install --path crates/mydb-server --force
+source ~/.cargo/env
+hash -r
+mydb --version
+which mydb
+```
+
 ### 2) 本地直接使用（最简）
+
+Windows：
 
 ```powershell
 mydb shell .\tmp\mydb
 ```
 
+macOS / Linux：
+
+```bash
+mydb shell ./tmp/mydb
+```
+
 ### 3) 一次性执行 SQL
+
+Windows：
 
 ```powershell
 mydb sql .\tmp\mydb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR); INSERT INTO users (id, name) VALUES (1, 'alice'); SELECT * FROM users;"
+```
+
+macOS / Linux：
+
+```bash
+mydb sql ./tmp/mydb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR); INSERT INTO users (id, name) VALUES (1, 'alice'); SELECT * FROM users;"
 ```
 
 ---
@@ -117,14 +145,24 @@ mydb status mydb-instance
 mydb stop mydb-instance
 ```
 
+说明：以上命令在 Windows、macOS、Linux 完全一致。
+
 ---
 
 ## HTTP API 模式（推荐跨语言接入）
 
 启动 HTTP 服务（示例）：
 
+Windows：
+
 ```powershell
 mydb http .\tmp\mydb 127.0.0.1:18080 --token my-secret --allow-origin http://localhost:3000
+```
+
+macOS / Linux：
+
+```bash
+mydb http ./tmp/mydb 127.0.0.1:18080 --token my-secret --allow-origin http://localhost:3000
 ```
 
 ### 路由
@@ -191,9 +229,49 @@ mydb describe <catalog_base> <table_name>
 
 ## 构建与测试
 
+Windows（PowerShell）：
+
 ```powershell
 cargo check --workspace
 cargo test --workspace
+```
+
+macOS / Linux（bash/zsh）：
+
+```bash
+cargo check --workspace
+cargo test --workspace
+```
+
+---
+
+## macOS / Linux 补充说明
+
+### 1) 直接运行 release 二进制
+
+```bash
+cargo build --release -p mydb
+./target/release/mydb --version
+```
+
+### 2) 如果终端提示找不到 `mydb`
+
+```bash
+echo $PATH
+ls ~/.cargo/bin/mydb
+source ~/.cargo/env
+```
+
+### 3) Linux 后台运行 HTTP 服务（简单方式）
+
+```bash
+nohup mydb http ./tmp/mydb 127.0.0.1:18080 --token my-secret > mydb-http.log 2>&1 &
+```
+
+查看进程：
+
+```bash
+ps -ef | grep mydb
 ```
 
 ---
