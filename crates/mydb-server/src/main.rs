@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::Hasher;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -16,10 +16,12 @@ use mydb_core::{Column, DataType, MyDbError, Result, Value};
 use mydb_exec::{Engine, Executor, QueryResult};
 use mydb_sql::parse_sql;
 use mydb_storage::Catalog;
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_INSTANCE_DIR: &str = "mydb-instance";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 15432;
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:18080";
 const DEFAULT_ADMIN: &str = "admin";
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,60 @@ struct ServerRuntime {
     config: ServerConfig,
     engine: Arc<Mutex<Engine>>,
     running: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct HttpApiRuntime {
+    engine: Arc<Mutex<Engine>>,
+    bearer_token: Option<String>,
+    allow_origin: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpSqlRequest {
+    sql: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpErrorResponse {
+    ok: bool,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpSqlResponse {
+    ok: bool,
+    results: Vec<HttpQueryResult>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum HttpQueryResult {
+    AffectedRows { count: usize },
+    Message { message: String },
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<HttpValue>>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum HttpValue {
+    Int(i32),
+    BigInt(i64),
+    Bool(bool),
+    Double(f64),
+    String(String),
+    Null,
 }
 
 impl ServerConfig {
@@ -106,6 +162,10 @@ fn run() -> Result<()> {
         Some("sql") => {
             let rest: Vec<String> = args.collect();
             cmd_sql(&rest)?;
+        }
+        Some("http") => {
+            let rest: Vec<String> = args.collect();
+            cmd_http(&rest)?;
         }
         Some(other) => {
             return Err(MyDbError::Parse(format!(
@@ -773,6 +833,106 @@ fn cmd_sql(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_http(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(MyDbError::Parse(
+            "usage: mydb http <catalog_base> [host:port] [--token <token>] [--allow-origin <origin>]".to_string(),
+        ));
+    }
+
+    let mut cursor = 0usize;
+    let base = args
+        .get(cursor)
+        .ok_or(MyDbError::Parse(
+            "usage: mydb http <catalog_base> [host:port] [--token <token>] [--allow-origin <origin>]".to_string(),
+        ))?
+        .clone();
+    cursor += 1;
+
+    let mut addr = DEFAULT_HTTP_ADDR.to_string();
+    if let Some(next) = args.get(cursor) {
+        if !next.starts_with("--") {
+            addr = next.clone();
+            cursor += 1;
+        }
+    }
+
+    let mut bearer_token: Option<String> = None;
+    let mut allow_origin = "*".to_string();
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--token" => {
+                cursor += 1;
+                let token = args.get(cursor).ok_or(MyDbError::Parse(
+                    "option --token requires a value".to_string(),
+                ))?;
+                if token.trim().is_empty() {
+                    return Err(MyDbError::Parse("token cannot be empty".to_string()));
+                }
+                bearer_token = Some(token.clone());
+                cursor += 1;
+            }
+            "--allow-origin" => {
+                cursor += 1;
+                let origin = args.get(cursor).ok_or(MyDbError::Parse(
+                    "option --allow-origin requires a value".to_string(),
+                ))?;
+                if origin.trim().is_empty() {
+                    return Err(MyDbError::Parse(
+                        "allow-origin cannot be empty".to_string(),
+                    ));
+                }
+                allow_origin = origin.clone();
+                cursor += 1;
+            }
+            other => {
+                return Err(MyDbError::Parse(format!(
+                    "unknown option '{other}' for http command"
+                )));
+            }
+        }
+    }
+
+    let listener = TcpListener::bind(&addr)?;
+    let runtime = Arc::new(HttpApiRuntime {
+        engine: Arc::new(Mutex::new(Engine::new(&base))),
+        bearer_token,
+        allow_origin,
+    });
+
+    println!("mydb HTTP API listening on http://{addr}");
+    println!("catalog_base: '{base}'");
+    println!(
+        "auth: {}",
+        if runtime.bearer_token.is_some() {
+            "bearer token enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("cors allow-origin: {}", runtime.allow_origin);
+    println!("routes:");
+    println!("  GET  /health");
+    println!("  POST /sql  {{\"sql\":\"SELECT ...\"}}");
+    println!("  GET  /openapi.json");
+    println!("  GET  /docs");
+    println!("press Ctrl+C to stop");
+
+    loop {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let runtime_cloned = Arc::clone(&runtime);
+                thread::spawn(move || {
+                    if let Err(err) = handle_http_client(stream, &runtime_cloned) {
+                        eprintln!("http client {peer} error: {err}");
+                    }
+                });
+            }
+            Err(err) => return Err(MyDbError::Io(err)),
+        }
+    }
+}
+
 fn cmd_shell(args: &[String]) -> Result<()> {
     if args.len() > 1 {
         return Err(MyDbError::Parse(
@@ -812,6 +972,457 @@ fn cmd_shell(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn handle_http_client(mut stream: TcpStream, runtime: &Arc<HttpApiRuntime>) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let Some(request) = read_http_request(&mut reader)? else {
+        return Ok(());
+    };
+    let path = request.path.split('?').next().unwrap_or(request.path.as_str());
+    let cors = cors_headers(&runtime.allow_origin);
+    if request.method == "OPTIONS" {
+        return write_http_response_with_headers(
+            &mut stream,
+            204,
+            "text/plain; charset=utf-8",
+            &[],
+            &cors,
+        );
+    }
+
+    match path {
+        "/health" => {
+            if request.method != "GET" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            let body = serde_json::json!({
+                "ok": true,
+                "service": "mydb-http",
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            write_http_json_response_with_headers(&mut stream, 200, &body, &cors)
+        }
+        "/openapi.json" => {
+            if request.method != "GET" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            let spec = openapi_spec_json();
+            write_http_json_response_with_headers(&mut stream, 200, &spec, &cors)
+        }
+        "/docs" => {
+            if request.method != "GET" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            let html = openapi_docs_html();
+            write_http_response_with_headers(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                html.as_bytes(),
+                &cors,
+            )
+        }
+        "/sql" => {
+            if request.method != "POST" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            if let Some(expected_token) = runtime.bearer_token.as_deref() {
+                let provided = request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| parse_bearer_token(value));
+                if provided != Some(expected_token) {
+                    let mut headers = cors.clone();
+                    headers.push((
+                        "WWW-Authenticate".to_string(),
+                        "Bearer realm=\"mydb-http\"".to_string(),
+                    ));
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        401,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: "unauthorized".to_string(),
+                        },
+                        &headers,
+                    );
+                }
+            }
+            let parsed: HttpSqlRequest = match serde_json::from_slice(&request.body) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: format!("invalid JSON payload: {err}"),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            let sql = parsed.sql.trim();
+            if sql.is_empty() {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    400,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "field `sql` cannot be empty".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            let statements = match split_sql_statements(sql) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            if statements.is_empty() {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    400,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "no SQL statement provided".to_string(),
+                    },
+                    &cors,
+                );
+            }
+
+            let mut results = Vec::with_capacity(statements.len());
+            let guard = runtime
+                .engine
+                .lock()
+                .map_err(|_| MyDbError::Corruption("engine lock poisoned".to_string()))?;
+            for statement in statements {
+                let result = match guard.execute_sql(&statement) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return write_http_json_response_with_headers(
+                            &mut stream,
+                            400,
+                            &HttpErrorResponse {
+                                ok: false,
+                                error: format!("statement `{statement}` failed: {err}"),
+                            },
+                            &cors,
+                        );
+                    }
+                };
+                results.push(http_query_result(result));
+            }
+            write_http_json_response_with_headers(
+                &mut stream,
+                200,
+                &HttpSqlResponse { ok: true, results },
+                &cors,
+            )
+        }
+        _ => write_http_json_response_with_headers(
+            &mut stream,
+            404,
+            &HttpErrorResponse {
+                ok: false,
+                error: "route not found".to_string(),
+            },
+            &cors,
+        ),
+    }
+}
+
+fn read_http_request(reader: &mut BufReader<TcpStream>) -> Result<Option<HttpRequest>> {
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(None);
+    }
+    let request_line = request_line.trim_end_matches(['\r', '\n']);
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or(MyDbError::Parse("invalid HTTP request line".to_string()))?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or(MyDbError::Parse("invalid HTTP request line".to_string()))?
+        .to_string();
+    let _version = parts
+        .next()
+        .ok_or(MyDbError::Parse("invalid HTTP request line".to_string()))?;
+
+    let mut headers = HashMap::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_len = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; content_len];
+    if content_len > 0 {
+        reader.read_exact(&mut body)?;
+    }
+
+    Ok(Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    }))
+}
+
+fn write_http_json_response_with_headers<T: Serialize>(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &T,
+    extra_headers: &[(String, String)],
+) -> Result<()> {
+    let payload = serde_json::to_vec(body)
+        .map_err(|err| MyDbError::Parse(format!("json encode error: {err}")))?;
+    write_http_response_with_headers(
+        stream,
+        status,
+        "application/json; charset=utf-8",
+        &payload,
+        extra_headers,
+    )
+}
+
+fn write_http_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<()> {
+    let status_text = http_status_text(status);
+    let mut header = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in extra_headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn http_status_text(status: u16) -> &'static str {
+    match status {
+        204 => "No Content",
+        200 => "OK",
+        401 => "Unauthorized",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    }
+}
+
+fn cors_headers(allow_origin: &str) -> Vec<(String, String)> {
+    vec![
+        ("Access-Control-Allow-Origin".to_string(), allow_origin.to_string()),
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            "GET, POST, OPTIONS".to_string(),
+        ),
+        (
+            "Access-Control-Allow-Headers".to_string(),
+            "Authorization, Content-Type".to_string(),
+        ),
+        ("Access-Control-Max-Age".to_string(), "86400".to_string()),
+    ]
+}
+
+fn parse_bearer_token(header_value: &str) -> Option<&str> {
+    let (scheme, token) = header_value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn openapi_spec_json() -> serde_json::Value {
+    serde_json::json!({
+      "openapi": "3.0.3",
+      "info": {
+        "title": "mydb HTTP API",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "HTTP gateway for executing SQL against mydb."
+      },
+      "paths": {
+        "/health": {
+          "get": {
+            "summary": "Health check",
+            "responses": {
+              "200": {"description": "Service is healthy"}
+            }
+          }
+        },
+        "/sql": {
+          "post": {
+            "summary": "Execute SQL batch",
+            "security": [{"bearerAuth": []}],
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": ["sql"],
+                    "properties": {
+                      "sql": {"type": "string", "example": "SHOW DATABASES; SELECT * FROM users;"}
+                    }
+                  }
+                }
+              }
+            },
+            "responses": {
+              "200": {"description": "SQL executed successfully"},
+              "400": {"description": "Bad SQL or payload"},
+              "401": {"description": "Unauthorized"}
+            }
+          }
+        },
+        "/openapi.json": {
+          "get": {
+            "summary": "OpenAPI document",
+            "responses": {
+              "200": {"description": "OpenAPI JSON"}
+            }
+          }
+        },
+        "/docs": {
+          "get": {
+            "summary": "Swagger UI page",
+            "responses": {
+              "200": {"description": "Swagger documentation"}
+            }
+          }
+        }
+      },
+      "components": {
+        "securitySchemes": {
+          "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "API Token"
+          }
+        }
+      }
+    })
+}
+
+fn openapi_docs_html() -> &'static str {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>mydb HTTP API Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: '/openapi.json',
+      dom_id: '#swagger-ui'
+    });
+  </script>
+</body>
+</html>"#
+}
+
+fn http_query_result(result: QueryResult) -> HttpQueryResult {
+    match result {
+        QueryResult::AffectedRows(count) => HttpQueryResult::AffectedRows { count },
+        QueryResult::Message(message) => HttpQueryResult::Message { message },
+        QueryResult::Rows { columns, rows } => HttpQueryResult::Rows {
+            columns,
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(http_value).collect())
+                .collect(),
+        },
+    }
+}
+
+fn http_value(value: Value) -> HttpValue {
+    match value {
+        Value::Int(v) => HttpValue::Int(v),
+        Value::BigInt(v) => HttpValue::BigInt(v),
+        Value::Bool(v) => HttpValue::Bool(v),
+        Value::Double(v) => HttpValue::Double(v),
+        Value::Varchar(v) => HttpValue::String(v),
+        Value::Null => HttpValue::Null,
+    }
+}
+
 fn parse_column_spec(spec: &str) -> Result<Column> {
     let (name, type_token) = spec
         .split_once(':')
@@ -843,6 +1454,7 @@ fn print_usage() {
     println!("  mydb describe <catalog_base> <table_name>");
     println!("  mydb parse-sql <sql>");
     println!("  mydb sql <catalog_base> <sql-or-batch>");
+    println!("  mydb http <catalog_base> [host:port] [--token <token>] [--allow-origin <origin>]");
 }
 
 fn print_query_result(result: QueryResult) {
