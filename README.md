@@ -288,3 +288,28 @@ ps -ef | grep rusedb
 - 当前 `rusedb` 使用自定义 SQL 解析/执行与协议，不直接兼容 MySQL/PostgreSQL 驱动。
 - 若需给 Java/Python/Node/Go 等多语言使用，建议统一通过 HTTP API 接入。
 
+## 下一步更新计划：DDL 演进能力（P1）
+
+### B1. ALTER TABLE
+
+- [ ] `ALTER TABLE ... ADD COLUMN`
+- [ ] `ALTER TABLE ... DROP COLUMN`（受限规则先行）
+- [ ] `ALTER TABLE ... ALTER COLUMN`（后续可扩）
+
+### B2. RENAME
+
+- [ ] `RENAME TABLE`
+- [ ] `RENAME COLUMN`
+- [ ] 关联元数据同步（索引、约束引用）
+
+### B3. 安全与兼容
+
+- [ ] DDL 事务边界与失败回滚策略
+- [ ] 向后兼容测试（旧数据目录升级）
+
+### B 验收标准
+
+- [ ] 基本 schema 演进可在不重建库的前提下完成
+- [ ] DDL 异常不破坏 catalog 一致性
+
+
