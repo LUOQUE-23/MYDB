@@ -1,6 +1,10 @@
-﻿# mydb
+﻿# RuseDB
 
-`mydb` 是一个用 Rust 实现的个人数据库项目，目标是做到本地可用、可持续迭代、便于跨语言接入。
+![RuseDB Logo](./RuseDB_LOGO.png)
+
+`RuseDB` 是一个用 Rust 实现的个人数据库项目，目标是做到本地可用、可持续迭代、便于跨语言接入。
+
+当前版本：`RuseDB V1.0.0`
 
 ## 当前已实现功能
 
@@ -13,6 +17,9 @@
   - `SHOW CURRENT DATABASE`
 - 表和索引管理：
   - `CREATE TABLE ...`
+  - `PRIMARY KEY`（列级/表级）
+  - `UNIQUE`（列级/表级，支持多列）
+  - `FOREIGN KEY ... REFERENCES ...`（支持 `RESTRICT`）
   - `DROP TABLE ...`
   - `SHOW TABLES`
   - `CREATE INDEX ... ON ...(...)`
@@ -43,13 +50,13 @@
 
 ### 4. 使用接口
 - 本地交互式 SQL Shell：
-  - `mydb shell [catalog_base]`
+  - `rusedb shell [catalog_base]`
 - 一次性 SQL 执行：
-  - `mydb sql <catalog_base> "<sql 批次>"`
+  - `rusedb sql <catalog_base> "<sql 批次>"`
 - 状态化 TCP 服务模式：
-  - `mydb init/start/status/connect/stop`
+  - `rusedb init/start/status/connect/stop`
 - HTTP API 网关（跨语言推荐）：
-  - `mydb http <catalog_base> [host:port] [--token <token>] [--allow-origin <origin>]`
+  - `rusedb http <catalog_base> [host:port] [--token <token>] [--allow-origin <origin>]`
 
 ### 5. HTTP API 增强能力
 - Bearer Token 认证（可选开启）。
@@ -62,30 +69,30 @@
 
 ## 快速开始
 
-### 1) 安装命令（让 `mydb` 全局可用）
+### 1) 安装命令（让 `rusedb` 全局可用）
 
 在项目根目录执行：
 
 #### Windows（PowerShell）
 
 ```powershell
-cargo install --path crates/mydb-server --force
+cargo install --path crates/rusedb-server --force
 ```
 
 重开终端后验证：
 
 ```powershell
-mydb --version
+rusedb --version
 ```
 
 #### macOS / Linux（bash 或 zsh）
 
 ```bash
-cargo install --path crates/mydb-server --force
+cargo install --path crates/rusedb-server --force
 source ~/.cargo/env
 hash -r
-mydb --version
-which mydb
+rusedb --version
+which rusedb
 ```
 
 ### 2) 本地直接使用（最简）
@@ -93,13 +100,13 @@ which mydb
 Windows：
 
 ```powershell
-mydb shell .\tmp\mydb
+rusedb shell .\tmp\rusedb
 ```
 
 macOS / Linux：
 
 ```bash
-mydb shell ./tmp/mydb
+rusedb shell ./tmp/rusedb
 ```
 
 ### 3) 一次性执行 SQL
@@ -107,13 +114,13 @@ mydb shell ./tmp/mydb
 Windows：
 
 ```powershell
-mydb sql .\tmp\mydb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR); INSERT INTO users (id, name) VALUES (1, 'alice'); SELECT * FROM users;"
+rusedb sql .\tmp\rusedb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR); INSERT INTO users (id, name) VALUES (1, 'alice'); SELECT * FROM users;"
 ```
 
 macOS / Linux：
 
 ```bash
-mydb sql ./tmp/mydb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR); INSERT INTO users (id, name) VALUES (1, 'alice'); SELECT * FROM users;"
+rusedb sql ./tmp/rusedb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR); INSERT INTO users (id, name) VALUES (1, 'alice'); SELECT * FROM users;"
 ```
 
 ---
@@ -123,26 +130,26 @@ mydb sql ./tmp/mydb "CREATE DATABASE app; USE app; CREATE TABLE users (id BIGINT
 初始化实例：
 
 ```powershell
-mydb init mydb-instance
+rusedb init rusedb-instance
 ```
 
 启动服务：
 
 ```powershell
-mydb start mydb-instance
+rusedb start rusedb-instance
 ```
 
 连接并交互执行：
 
 ```powershell
-mydb connect mydb-instance
+rusedb connect rusedb-instance
 ```
 
 查看状态与停服：
 
 ```powershell
-mydb status mydb-instance
-mydb stop mydb-instance
+rusedb status rusedb-instance
+rusedb stop rusedb-instance
 ```
 
 说明：以上命令在 Windows、macOS、Linux 完全一致。
@@ -156,13 +163,13 @@ mydb stop mydb-instance
 Windows：
 
 ```powershell
-mydb http .\tmp\mydb 127.0.0.1:18080 --token my-secret --allow-origin http://localhost:3000
+rusedb http .\tmp\rusedb 127.0.0.1:18080 --token my-secret --allow-origin http://localhost:3000
 ```
 
 macOS / Linux：
 
 ```bash
-mydb http ./tmp/mydb 127.0.0.1:18080 --token my-secret --allow-origin http://localhost:3000
+rusedb http ./tmp/rusedb 127.0.0.1:18080 --token my-secret --allow-origin http://localhost:3000
 ```
 
 ### 路由
@@ -217,12 +224,12 @@ curl -X POST http://127.0.0.1:18080/sql \
 ## 常用命令
 
 ```powershell
-mydb help
-mydb parse-sql "SELECT * FROM users"
-mydb create-table <catalog_base> <table_name> <col:type[?]>...
-mydb drop-table <catalog_base> <table_name>
-mydb show-tables <catalog_base>
-mydb describe <catalog_base> <table_name>
+rusedb help
+rusedb parse-sql "SELECT * FROM users"
+rusedb create-table <catalog_base> <table_name> <col:type[?]>...
+rusedb drop-table <catalog_base> <table_name>
+rusedb show-tables <catalog_base>
+rusedb describe <catalog_base> <table_name>
 ```
 
 ---
@@ -250,33 +257,34 @@ cargo test --workspace
 ### 1) 直接运行 release 二进制
 
 ```bash
-cargo build --release -p mydb
-./target/release/mydb --version
+cargo build --release -p rusedb
+./target/release/rusedb --version
 ```
 
-### 2) 如果终端提示找不到 `mydb`
+### 2) 如果终端提示找不到 `rusedb`
 
 ```bash
 echo $PATH
-ls ~/.cargo/bin/mydb
+ls ~/.cargo/bin/rusedb
 source ~/.cargo/env
 ```
 
 ### 3) Linux 后台运行 HTTP 服务（简单方式）
 
 ```bash
-nohup mydb http ./tmp/mydb 127.0.0.1:18080 --token my-secret > mydb-http.log 2>&1 &
+nohup rusedb http ./tmp/rusedb 127.0.0.1:18080 --token my-secret > rusedb-http.log 2>&1 &
 ```
 
 查看进程：
 
 ```bash
-ps -ef | grep mydb
+ps -ef | grep rusedb
 ```
 
 ---
 
 ## 说明
 
-- 当前 `mydb` 使用自定义 SQL 解析/执行与协议，不直接兼容 MySQL/PostgreSQL 驱动。
+- 当前 `rusedb` 使用自定义 SQL 解析/执行与协议，不直接兼容 MySQL/PostgreSQL 驱动。
 - 若需给 Java/Python/Node/Go 等多语言使用，建议统一通过 HTTP API 接入。
+

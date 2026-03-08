@@ -1,17 +1,17 @@
 [workspace]
 members = [
-    "crates/mydb-core",
-    "crates/mydb-storage",
-    "crates/mydb-sql",
-    "crates/mydb-exec",
-    "crates/mydb-server",
-    "crates/mydb-tests",
+    "crates/rusedb-core",
+    "crates/rusedb-storage",
+    "crates/rusedb-sql",
+    "crates/rusedb-exec",
+    "crates/rusedb-server",
+    "crates/rusedb-tests",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
-authors = ["mydb"]
+authors = ["RuseDB"]
 rust-version = "1.85"

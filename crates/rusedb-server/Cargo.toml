@@ -1,0 +1,15 @@
+[package]
+name = "rusedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusedb-core = { path = "../rusedb-core" }
+rusedb-exec = { path = "../rusedb-exec" }
+rusedb-sql = { path = "../rusedb-sql" }
+rusedb-storage = { path = "../rusedb-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

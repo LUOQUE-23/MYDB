@@ -1,0 +1,12 @@
+[package]
+name = "rusedb-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusedb-core = { path = "../rusedb-core" }
+rusedb-exec = { path = "../rusedb-exec" }
+rusedb-storage = { path = "../rusedb-storage" }

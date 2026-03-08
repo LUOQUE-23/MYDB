@@ -2,11 +2,11 @@
 Cargo.lock
 
 # local runtime data / instances
-/mydb-instance/
+/rusedb-instance/
 /tmp/
-/mydb.columns
-/mydb.indexes
-/mydb.tables
+/rusedb.columns
+/rusedb.indexes
+/rusedb.tables
 
 # storage engine artifacts
 *.columns
