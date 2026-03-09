@@ -224,3 +224,142 @@ fn catalog_persists_foreign_key_constraints_across_restart() {
 
     cleanup_dir(&dir);
 }
+
+#[test]
+fn catalog_add_drop_column_persists() {
+    let dir = unique_test_dir("catalog-alter-columns");
+    let base = dir.join("rusedb");
+
+    {
+        let mut catalog = Catalog::open(&base).unwrap();
+        catalog
+            .create_table(
+                "logs",
+                vec![
+                    Column::new("id", DataType::BigInt, false),
+                    Column::new("message", DataType::Varchar, true),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        catalog
+            .add_column("logs", Column::new("created_at", DataType::BigInt, true))
+            .unwrap();
+        catalog.drop_column("logs", "message").unwrap();
+    }
+
+    {
+        let catalog = Catalog::open(&base).unwrap();
+        let schema = catalog.describe_table("logs").unwrap();
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.columns[0].name, "id");
+        assert_eq!(schema.columns[1].name, "created_at");
+    }
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn catalog_rename_table_and_column_updates_foreign_key_reference() {
+    let dir = unique_test_dir("catalog-rename");
+    let base = dir.join("rusedb");
+
+    {
+        let mut catalog = Catalog::open(&base).unwrap();
+        catalog
+            .create_table(
+                "users",
+                vec![Column::new("id", DataType::BigInt, false)],
+                vec![ConstraintDef {
+                    name: "pk_users".to_string(),
+                    kind: ConstraintKind::PrimaryKey,
+                    key_columns: vec!["id".to_string()],
+                    referenced_table: None,
+                    referenced_columns: Vec::new(),
+                }],
+            )
+            .unwrap();
+        catalog
+            .create_table(
+                "orders",
+                vec![
+                    Column::new("id", DataType::BigInt, false),
+                    Column::new("user_id", DataType::BigInt, true),
+                ],
+                vec![
+                    ConstraintDef {
+                        name: "pk_orders".to_string(),
+                        kind: ConstraintKind::PrimaryKey,
+                        key_columns: vec!["id".to_string()],
+                        referenced_table: None,
+                        referenced_columns: Vec::new(),
+                    },
+                    ConstraintDef {
+                        name: "fk_orders_user".to_string(),
+                        kind: ConstraintKind::ForeignKey,
+                        key_columns: vec!["user_id".to_string()],
+                        referenced_table: Some("users".to_string()),
+                        referenced_columns: vec!["id".to_string()],
+                    },
+                ],
+            )
+            .unwrap();
+
+        catalog.rename_table("users", "accounts").unwrap();
+        catalog
+            .rename_column("accounts", "id", "account_id")
+            .unwrap();
+    }
+
+    {
+        let catalog = Catalog::open(&base).unwrap();
+        let users_constraints = catalog.list_constraints("accounts").unwrap();
+        assert!(users_constraints.iter().any(|c| {
+            matches!(c.kind, ConstraintKind::PrimaryKey)
+                && c.key_columns == vec!["account_id".to_string()]
+        }));
+
+        let order_constraints = catalog.list_constraints("orders").unwrap();
+        let fk = order_constraints
+            .iter()
+            .find(|c| c.name == "fk_orders_user")
+            .unwrap();
+        assert_eq!(fk.referenced_table.as_deref(), Some("accounts"));
+        assert_eq!(fk.referenced_columns, vec!["account_id".to_string()]);
+    }
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn catalog_alter_column_type_and_nullability_persists() {
+    let dir = unique_test_dir("catalog-alter-column");
+    let base = dir.join("rusedb");
+
+    {
+        let mut catalog = Catalog::open(&base).unwrap();
+        catalog
+            .create_table(
+                "metrics",
+                vec![
+                    Column::new("id", DataType::BigInt, false),
+                    Column::new("score", DataType::BigInt, true),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        catalog
+            .alter_column("metrics", "score", Some(DataType::Double), Some(false))
+            .unwrap();
+    }
+
+    {
+        let catalog = Catalog::open(&base).unwrap();
+        let schema = catalog.describe_table("metrics").unwrap();
+        let (_, score) = schema.find_column("score").unwrap();
+        assert_eq!(score.data_type, DataType::Double);
+        assert!(!score.nullable);
+    }
+
+    cleanup_dir(&dir);
+}

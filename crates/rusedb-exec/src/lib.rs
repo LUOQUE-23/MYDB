@@ -11,8 +11,8 @@ use rusedb_core::{
     Column, DataType, IndexInfo, Result, Row, RuseDbError, Schema, TableInfo, Value,
 };
 use rusedb_sql::{
-    AggregateFunction, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem, SelectItem,
-    Statement, TableConstraint, TableConstraintKind, UnaryOp, parse_sql,
+    AggregateFunction, AlterColumnAction, BinaryOp, ColumnDef, Expr, JoinClause, Literal,
+    OrderByItem, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp, parse_sql,
 };
 use rusedb_storage::{
     Catalog, ConstraintDef, ConstraintInfo, ConstraintKind, HeapFile, IndexKeyKind, OrderedIndex,
@@ -178,6 +178,25 @@ impl Engine {
                 constraints,
             } => self.exec_create_table(catalog_base, &name, columns, constraints),
             Statement::DropTable { name } => self.exec_drop_table(catalog_base, &name),
+            Statement::AlterTableAddColumn { table, column } => {
+                self.exec_alter_table_add_column(catalog_base, &table, column)
+            }
+            Statement::AlterTableDropColumn { table, column } => {
+                self.exec_alter_table_drop_column(catalog_base, &table, &column)
+            }
+            Statement::AlterTableAlterColumn {
+                table,
+                column,
+                action,
+            } => self.exec_alter_table_alter_column(catalog_base, &table, &column, action),
+            Statement::RenameTable { old_name, new_name } => {
+                self.exec_rename_table(catalog_base, &old_name, &new_name)
+            }
+            Statement::RenameColumn {
+                table,
+                old_name,
+                new_name,
+            } => self.exec_rename_column(catalog_base, &table, &old_name, &new_name),
             Statement::CreateIndex {
                 name,
                 table,
@@ -270,6 +289,232 @@ impl Engine {
         Ok(QueryResult::Message(format!(
             "dropped table '{}'",
             table_name
+        )))
+    }
+
+    fn exec_alter_table_add_column(
+        &self,
+        catalog_base: &Path,
+        table_name: &str,
+        column: ColumnDef,
+    ) -> Result<QueryResult> {
+        if column.primary_key || column.unique || column.references.is_some() {
+            return Err(RuseDbError::Parse(
+                "ALTER TABLE ADD COLUMN currently does not support PRIMARY KEY/UNIQUE/REFERENCES"
+                    .to_string(),
+            ));
+        }
+
+        let mut catalog = Catalog::open(catalog_base)?;
+        let table = find_table(&catalog, table_name)?;
+        let old_schema = catalog.describe_table(&table.name)?;
+        let mut heap = HeapFile::open(table_heap_path(catalog_base, table.table_id))?;
+        let has_rows = !heap.scan_records()?.is_empty();
+        if has_rows && !column.nullable {
+            return Err(RuseDbError::Parse(format!(
+                "cannot add NOT NULL column '{}' to non-empty table '{}'",
+                column.name, table_name
+            )));
+        }
+
+        catalog.add_column(
+            &table.name,
+            Column::new(column.name, column.data_type, column.nullable),
+        )?;
+        let new_schema = catalog.describe_table(&table.name)?;
+
+        rewrite_table_rows(
+            catalog_base,
+            table.table_id,
+            &old_schema,
+            &new_schema,
+            |row| {
+                let mut values = row.values.clone();
+                values.push(Value::Null);
+                Ok(values)
+            },
+        )?;
+        rebuild_table_indexes(catalog_base, &catalog, &table.name, &new_schema)?;
+
+        Ok(QueryResult::Message(format!(
+            "altered table '{}': added column",
+            table_name
+        )))
+    }
+
+    fn exec_alter_table_drop_column(
+        &self,
+        catalog_base: &Path,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<QueryResult> {
+        let mut catalog = Catalog::open(catalog_base)?;
+        let table = find_table(&catalog, table_name)?;
+        let old_schema = catalog.describe_table(&table.name)?;
+        if old_schema.columns.len() <= 1 {
+            return Err(RuseDbError::InvalidSchema(format!(
+                "cannot drop last column from table '{}'",
+                table_name
+            )));
+        }
+        let (drop_index, _) = old_schema
+            .find_column(column_name)
+            .ok_or(RuseDbError::NotFound {
+                object: "column".to_string(),
+                name: column_name.to_string(),
+            })?;
+
+        ensure_drop_column_allowed_by_metadata(&catalog, &table.name, column_name)?;
+        catalog.drop_column(&table.name, column_name)?;
+        let new_schema = catalog.describe_table(&table.name)?;
+
+        rewrite_table_rows(
+            catalog_base,
+            table.table_id,
+            &old_schema,
+            &new_schema,
+            |row| {
+                let mut values = row.values.clone();
+                values.remove(drop_index);
+                Ok(values)
+            },
+        )?;
+        rebuild_table_indexes(catalog_base, &catalog, &table.name, &new_schema)?;
+
+        Ok(QueryResult::Message(format!(
+            "altered table '{}': dropped column '{}'",
+            table_name, column_name
+        )))
+    }
+
+    fn exec_alter_table_alter_column(
+        &self,
+        catalog_base: &Path,
+        table_name: &str,
+        column_name: &str,
+        action: AlterColumnAction,
+    ) -> Result<QueryResult> {
+        let mut catalog = Catalog::open(catalog_base)?;
+        let table = find_table(&catalog, table_name)?;
+        let old_schema = catalog.describe_table(&table.name)?;
+        let (column_index, column) =
+            old_schema
+                .find_column(column_name)
+                .ok_or(RuseDbError::NotFound {
+                    object: "column".to_string(),
+                    name: column_name.to_string(),
+                })?;
+        let normalized_column = column.name.to_ascii_lowercase();
+
+        match action {
+            AlterColumnAction::SetDataType(new_type) => {
+                if column.data_type == new_type {
+                    return Ok(QueryResult::Message(format!(
+                        "altered table '{}': column '{}' type unchanged",
+                        table_name, column.name
+                    )));
+                }
+                ensure_alter_column_type_allowed_by_metadata(
+                    &catalog,
+                    &table.name,
+                    &normalized_column,
+                    new_type,
+                )?;
+
+                let mut new_columns = old_schema.columns.clone();
+                new_columns[column_index].data_type = new_type;
+                let new_schema = Schema::new(new_columns)?;
+
+                rewrite_table_rows(
+                    catalog_base,
+                    table.table_id,
+                    &old_schema,
+                    &new_schema,
+                    |row| {
+                        let mut values = row.values.clone();
+                        values[column_index] = cast_value_to_type(
+                            &values[column_index],
+                            new_type,
+                            &old_schema.columns[column_index].name,
+                        )?;
+                        Ok(values)
+                    },
+                )?;
+
+                catalog.alter_column(&table.name, column_name, Some(new_type), None)?;
+                rebuild_table_indexes(catalog_base, &catalog, &table.name, &new_schema)?;
+                Ok(QueryResult::Message(format!(
+                    "altered table '{}': column '{}' type changed to {}",
+                    table_name,
+                    column.name,
+                    new_type.as_str()
+                )))
+            }
+            AlterColumnAction::SetNotNull => {
+                if !column.nullable {
+                    return Ok(QueryResult::Message(format!(
+                        "altered table '{}': column '{}' already NOT NULL",
+                        table_name, column.name
+                    )));
+                }
+                let mut heap = HeapFile::open(table_heap_path(catalog_base, table.table_id))?;
+                for (_rid, raw) in heap.scan_records()? {
+                    let row = Row::decode(&old_schema, &raw)?;
+                    if matches!(row.values[column_index], Value::Null) {
+                        return Err(RuseDbError::Parse(format!(
+                            "cannot set NOT NULL on '{}.{}': existing rows contain NULL values",
+                            table_name, column.name
+                        )));
+                    }
+                }
+                catalog.alter_column(&table.name, column_name, None, Some(false))?;
+                Ok(QueryResult::Message(format!(
+                    "altered table '{}': column '{}' set NOT NULL",
+                    table_name, column.name
+                )))
+            }
+            AlterColumnAction::DropNotNull => {
+                ensure_drop_not_null_allowed_by_metadata(
+                    &catalog,
+                    &table.name,
+                    &normalized_column,
+                )?;
+                catalog.alter_column(&table.name, column_name, None, Some(true))?;
+                Ok(QueryResult::Message(format!(
+                    "altered table '{}': column '{}' dropped NOT NULL",
+                    table_name, column.name
+                )))
+            }
+        }
+    }
+
+    fn exec_rename_table(
+        &self,
+        catalog_base: &Path,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<QueryResult> {
+        let mut catalog = Catalog::open(catalog_base)?;
+        let renamed = catalog.rename_table(old_name, new_name)?;
+        Ok(QueryResult::Message(format!(
+            "renamed table '{}' to '{}'",
+            old_name, renamed.name
+        )))
+    }
+
+    fn exec_rename_column(
+        &self,
+        catalog_base: &Path,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<QueryResult> {
+        let mut catalog = Catalog::open(catalog_base)?;
+        let _ = find_table(&catalog, table_name)?;
+        let renamed = catalog.rename_column(table_name, old_name, new_name)?;
+        Ok(QueryResult::Message(format!(
+            "renamed column '{}.{}' to '{}'",
+            table_name, old_name, renamed.name
         )))
     }
 
@@ -877,6 +1122,11 @@ fn is_mutating_statement(statement: &Statement) -> bool {
         statement,
         Statement::CreateTable { .. }
             | Statement::DropTable { .. }
+            | Statement::AlterTableAddColumn { .. }
+            | Statement::AlterTableDropColumn { .. }
+            | Statement::AlterTableAlterColumn { .. }
+            | Statement::RenameTable { .. }
+            | Statement::RenameColumn { .. }
             | Statement::CreateIndex { .. }
             | Statement::Insert { .. }
             | Statement::Delete { .. }
@@ -1251,6 +1501,80 @@ fn load_table_indexes(
         });
     }
     Ok(out)
+}
+
+fn rewrite_table_rows<F>(
+    catalog_base: &Path,
+    table_id: u32,
+    old_schema: &Schema,
+    new_schema: &Schema,
+    mut transform: F,
+) -> Result<()>
+where
+    F: FnMut(&Row) -> Result<Vec<Value>>,
+{
+    let heap_path = table_heap_path(catalog_base, table_id);
+    let mut old_heap = HeapFile::open(&heap_path)?;
+    let mut rewritten_rows = Vec::new();
+    for (_rid, raw) in old_heap.scan_records()? {
+        let row = Row::decode(old_schema, &raw)?;
+        let mut values = transform(&row)?;
+        normalize_values_for_schema(new_schema, &mut values)?;
+        rewritten_rows.push(Row::new(values).encode(new_schema)?);
+    }
+    drop(old_heap);
+
+    if heap_path.exists() {
+        fs::remove_file(&heap_path)?;
+    }
+    let mut new_heap = HeapFile::open(&heap_path)?;
+    for raw in rewritten_rows {
+        new_heap.insert_record(&raw)?;
+    }
+    new_heap.sync()?;
+    Ok(())
+}
+
+fn rebuild_table_indexes(
+    catalog_base: &Path,
+    catalog: &Catalog,
+    table_name: &str,
+    schema: &Schema,
+) -> Result<()> {
+    let table = find_table(catalog, table_name)?;
+    let indexes = catalog.list_indexes(table_name)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let mut heap = HeapFile::open(table_heap_path(catalog_base, table.table_id))?;
+    let rows = heap.scan_records()?;
+    let mut opened_indexes = Vec::new();
+    for info in indexes {
+        let (column_index, column) =
+            schema
+                .find_column(&info.key_columns)
+                .ok_or(RuseDbError::Corruption(format!(
+                    "index '{}' refers to missing column '{}'",
+                    info.name, info.key_columns
+                )))?;
+        let key_kind = IndexKeyKind::from_data_type(column.data_type)?;
+        let path = index_file_path(catalog_base, info.index_id);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        opened_indexes.push((info, column_index, OrderedIndex::open(path, key_kind)?));
+    }
+
+    for (rid, raw) in rows {
+        let row = Row::decode(schema, &raw)?;
+        for (_, column_index, index) in &mut opened_indexes {
+            if let Some(key) = index.key_from_value(&row.values[*column_index])? {
+                index.insert(key, rid)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_table_definition(
@@ -1781,6 +2105,221 @@ fn ensure_drop_table_allowed_by_fk(
         )));
     }
     Ok(())
+}
+
+fn ensure_drop_column_allowed_by_metadata(
+    catalog: &Catalog,
+    table_name: &str,
+    column_name: &str,
+) -> Result<()> {
+    let normalized_table = table_name.to_ascii_lowercase();
+    let normalized_column = column_name.to_ascii_lowercase();
+
+    for index in catalog.list_indexes(table_name)? {
+        if index.key_columns.eq_ignore_ascii_case(column_name) {
+            return Err(RuseDbError::Parse(format!(
+                "cannot drop column '{}.{}': used by index '{}'",
+                table_name, column_name, index.name
+            )));
+        }
+    }
+
+    for constraint in catalog.list_constraints(table_name)? {
+        if constraint
+            .key_columns
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case(column_name))
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot drop column '{}.{}': used by constraint '{}'",
+                table_name, column_name, constraint.name
+            )));
+        }
+        if constraint
+            .referenced_table
+            .as_ref()
+            .map(|table| table.to_ascii_lowercase() == normalized_table)
+            .unwrap_or(false)
+            && constraint
+                .referenced_columns
+                .iter()
+                .any(|col| col.eq_ignore_ascii_case(column_name))
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot drop column '{}.{}': referenced by constraint '{}'",
+                table_name, column_name, constraint.name
+            )));
+        }
+    }
+
+    for (child_table, fk) in load_referencing_foreign_keys(catalog, table_name)? {
+        if fk
+            .info
+            .referenced_columns
+            .iter()
+            .any(|col| col.to_ascii_lowercase() == normalized_column)
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot drop column '{}.{}': referenced by FOREIGN KEY '{}' on table '{}'",
+                table_name, column_name, fk.info.name, child_table
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_alter_column_type_allowed_by_metadata(
+    catalog: &Catalog,
+    table_name: &str,
+    normalized_column: &str,
+    new_type: DataType,
+) -> Result<()> {
+    for constraint in catalog.list_constraints(table_name)? {
+        if constraint
+            .key_columns
+            .iter()
+            .any(|col| col.to_ascii_lowercase() == normalized_column)
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot alter type of '{}.{}': used by constraint '{}'",
+                table_name, normalized_column, constraint.name
+            )));
+        }
+        if constraint
+            .referenced_table
+            .as_ref()
+            .map(|table| table.eq_ignore_ascii_case(table_name))
+            .unwrap_or(false)
+            && constraint
+                .referenced_columns
+                .iter()
+                .any(|col| col.to_ascii_lowercase() == normalized_column)
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot alter type of '{}.{}': referenced by constraint '{}'",
+                table_name, normalized_column, constraint.name
+            )));
+        }
+    }
+
+    for (child_table, fk) in load_referencing_foreign_keys(catalog, table_name)? {
+        if fk
+            .info
+            .referenced_columns
+            .iter()
+            .any(|col| col.to_ascii_lowercase() == normalized_column)
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot alter type of '{}.{}': referenced by FOREIGN KEY '{}' on table '{}'",
+                table_name, normalized_column, fk.info.name, child_table
+            )));
+        }
+    }
+
+    for index in catalog.list_indexes(table_name)? {
+        if index.key_columns.to_ascii_lowercase() == normalized_column
+            && let Err(err) = IndexKeyKind::from_data_type(new_type)
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot alter type of indexed column '{}.{}' to {}: {}",
+                table_name,
+                normalized_column,
+                new_type.as_str(),
+                err
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_drop_not_null_allowed_by_metadata(
+    catalog: &Catalog,
+    table_name: &str,
+    normalized_column: &str,
+) -> Result<()> {
+    for constraint in catalog.list_constraints(table_name)? {
+        if matches!(constraint.kind, ConstraintKind::PrimaryKey)
+            && constraint
+                .key_columns
+                .iter()
+                .any(|col| col.to_ascii_lowercase() == normalized_column)
+        {
+            return Err(RuseDbError::Parse(format!(
+                "cannot drop NOT NULL from '{}.{}': part of PRIMARY KEY '{}'",
+                table_name, normalized_column, constraint.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cast_value_to_type(value: &Value, target: DataType, column_name: &str) -> Result<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let out = match (value, target) {
+        (Value::Int(v), DataType::Int) => Value::Int(*v),
+        (Value::Int(v), DataType::BigInt) => Value::BigInt(i64::from(*v)),
+        (Value::Int(v), DataType::Double) => Value::Double(*v as f64),
+        (Value::BigInt(v), DataType::BigInt) => Value::BigInt(*v),
+        (Value::BigInt(v), DataType::Int) => {
+            let casted = i32::try_from(*v).map_err(|_| RuseDbError::TypeMismatch {
+                column: column_name.to_string(),
+                expected: "INT".to_string(),
+                actual: "BIGINT(out-of-range)".to_string(),
+            })?;
+            Value::Int(casted)
+        }
+        (Value::BigInt(v), DataType::Double) => Value::Double(*v as f64),
+        (Value::Double(v), DataType::Double) => Value::Double(*v),
+        (Value::Double(v), DataType::BigInt) => {
+            if !v.is_finite() || v.fract() != 0.0 {
+                return Err(RuseDbError::TypeMismatch {
+                    column: column_name.to_string(),
+                    expected: "BIGINT".to_string(),
+                    actual: "DOUBLE(non-integer)".to_string(),
+                });
+            }
+            if *v < i64::MIN as f64 || *v > i64::MAX as f64 {
+                return Err(RuseDbError::TypeMismatch {
+                    column: column_name.to_string(),
+                    expected: "BIGINT".to_string(),
+                    actual: "DOUBLE(out-of-range)".to_string(),
+                });
+            }
+            Value::BigInt(*v as i64)
+        }
+        (Value::Double(v), DataType::Int) => {
+            if !v.is_finite() || v.fract() != 0.0 {
+                return Err(RuseDbError::TypeMismatch {
+                    column: column_name.to_string(),
+                    expected: "INT".to_string(),
+                    actual: "DOUBLE(non-integer)".to_string(),
+                });
+            }
+            if *v < i32::MIN as f64 || *v > i32::MAX as f64 {
+                return Err(RuseDbError::TypeMismatch {
+                    column: column_name.to_string(),
+                    expected: "INT".to_string(),
+                    actual: "DOUBLE(out-of-range)".to_string(),
+                });
+            }
+            Value::Int(*v as i32)
+        }
+        (Value::Bool(v), DataType::Bool) => Value::Bool(*v),
+        (Value::Varchar(v), DataType::Varchar) => Value::Varchar(v.clone()),
+        (_, target_type) => {
+            return Err(RuseDbError::TypeMismatch {
+                column: column_name.to_string(),
+                expected: target_type.as_str().to_string(),
+                actual: value.type_name().to_string(),
+            });
+        }
+    };
+    Ok(out)
 }
 
 fn ensure_parent_delete_restrict(

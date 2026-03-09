@@ -706,7 +706,9 @@ fn sql_engine_foreign_key_restrict_consistent_within_transaction() {
     engine
         .execute_sql("DELETE FROM orders WHERE id = 100")
         .unwrap();
-    let delete_parent_after_child = engine.execute_sql("DELETE FROM users WHERE id = 1").unwrap();
+    let delete_parent_after_child = engine
+        .execute_sql("DELETE FROM users WHERE id = 1")
+        .unwrap();
     assert_eq!(delete_parent_after_child, QueryResult::AffectedRows(1));
     engine.execute_sql("COMMIT").unwrap();
 
@@ -724,6 +726,355 @@ fn sql_engine_foreign_key_restrict_consistent_within_transaction() {
         QueryResult::Rows {
             columns: vec!["id".to_string(), "user_id".to_string()],
             rows: vec![],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_alter_add_drop_and_rename_table_column() {
+    let dir = unique_test_dir("sql-engine-alter-rename");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice')")
+        .unwrap();
+
+    engine
+        .execute_sql("ALTER TABLE users ADD COLUMN email VARCHAR")
+        .unwrap();
+    let after_add = engine
+        .execute_sql("SELECT * FROM users ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        after_add,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string(), "email".to_string()],
+            rows: vec![vec![
+                Value::BigInt(1),
+                Value::Varchar("alice".to_string()),
+                Value::Null,
+            ]],
+        }
+    );
+
+    engine
+        .execute_sql("UPDATE users SET email = 'alice@example.com' WHERE id = 1")
+        .unwrap();
+    engine
+        .execute_sql("RENAME COLUMN users.email TO contact")
+        .unwrap();
+    let renamed_col = engine
+        .execute_sql("SELECT id, contact FROM users ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        renamed_col,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "contact".to_string()],
+            rows: vec![vec![
+                Value::BigInt(1),
+                Value::Varchar("alice@example.com".to_string()),
+            ]],
+        }
+    );
+
+    engine
+        .execute_sql("ALTER TABLE users DROP COLUMN contact")
+        .unwrap();
+    let after_drop = engine.execute_sql("SELECT * FROM users").unwrap();
+    assert_eq!(
+        after_drop,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("alice".to_string())]],
+        }
+    );
+
+    engine
+        .execute_sql("RENAME TABLE users TO app_users")
+        .unwrap();
+    let old_table = engine.execute_sql("SELECT * FROM users").unwrap_err();
+    assert!(old_table.to_string().contains("table 'users' not found"));
+    let renamed_table = engine.execute_sql("SELECT * FROM app_users").unwrap();
+    assert_eq!(
+        renamed_table,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::Varchar("alice".to_string())]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_rename_updates_constraints_and_drop_column_restrictions() {
+    let dir = unique_test_dir("sql-engine-rename-metadata");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email VARCHAR, CONSTRAINT uq_users_email UNIQUE (email))",
+        )
+        .unwrap();
+    engine
+        .execute_sql("CREATE INDEX idx_users_email ON users (email)")
+        .unwrap();
+    engine
+        .execute_sql(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT, CONSTRAINT fk_orders_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT ON UPDATE RESTRICT)",
+        )
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, email) VALUES (1, 'a@example.com')")
+        .unwrap();
+
+    engine
+        .execute_sql("RENAME COLUMN users.email TO login")
+        .unwrap();
+    let duplicate_login = engine
+        .execute_sql("INSERT INTO users (id, login) VALUES (2, 'a@example.com')")
+        .unwrap_err();
+    assert!(
+        duplicate_login
+            .to_string()
+            .contains("duplicate key violates UNIQUE constraint")
+    );
+
+    engine
+        .execute_sql("RENAME TABLE users TO accounts")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO orders (id, user_id) VALUES (100, 1)")
+        .unwrap();
+    let delete_parent = engine
+        .execute_sql("DELETE FROM accounts WHERE id = 1")
+        .unwrap_err();
+    assert!(
+        delete_parent
+            .to_string()
+            .contains("cannot delete from 'accounts'")
+    );
+
+    let drop_indexed = engine
+        .execute_sql("ALTER TABLE accounts DROP COLUMN login")
+        .unwrap_err();
+    assert!(drop_indexed.to_string().contains("cannot drop column"));
+
+    let drop_fk_parent = engine
+        .execute_sql("ALTER TABLE accounts DROP COLUMN id")
+        .unwrap_err();
+    assert!(drop_fk_parent.to_string().contains("cannot drop column"));
+
+    let add_not_null = engine
+        .execute_sql("ALTER TABLE accounts ADD COLUMN created_at BIGINT NOT NULL")
+        .unwrap_err();
+    assert!(
+        add_not_null
+            .to_string()
+            .contains("cannot add NOT NULL column")
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_ddl_works_with_transaction_rollback() {
+    let dir = unique_test_dir("sql-engine-ddl-tx");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id) VALUES (1), (2)")
+        .unwrap();
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine
+        .execute_sql("ALTER TABLE t ADD COLUMN age BIGINT")
+        .unwrap();
+    engine.execute_sql("ROLLBACK").unwrap();
+
+    let after_rollback_add = engine
+        .execute_sql("SELECT * FROM t ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        after_rollback_add,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(1)], vec![Value::BigInt(2)]],
+        }
+    );
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine.execute_sql("RENAME TABLE t TO t_new").unwrap();
+    engine.execute_sql("ROLLBACK").unwrap();
+    let old_name_ok = engine
+        .execute_sql("SELECT id FROM t ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        old_name_ok,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(1)], vec![Value::BigInt(2)]],
+        }
+    );
+    let renamed_missing = engine.execute_sql("SELECT id FROM t_new").unwrap_err();
+    assert!(
+        renamed_missing
+            .to_string()
+            .contains("table 't_new' not found")
+    );
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine.execute_sql("RENAME COLUMN t.id TO user_id").unwrap();
+    engine.execute_sql("ROLLBACK").unwrap();
+    let still_old_column = engine
+        .execute_sql("SELECT id FROM t ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        still_old_column,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(1)], vec![Value::BigInt(2)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_alter_column_type_and_nullability() {
+    let dir = unique_test_dir("sql-engine-alter-column");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE metrics (id BIGINT NOT NULL, score BIGINT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO metrics (id, score) VALUES (1, 10), (2, NULL)")
+        .unwrap();
+
+    engine
+        .execute_sql("ALTER TABLE metrics ALTER COLUMN score TYPE DOUBLE")
+        .unwrap();
+    let after_type = engine
+        .execute_sql("SELECT id, score FROM metrics ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        after_type,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "score".to_string()],
+            rows: vec![
+                vec![Value::BigInt(1), Value::Double(10.0)],
+                vec![Value::BigInt(2), Value::Null],
+            ],
+        }
+    );
+
+    let set_not_null_err = engine
+        .execute_sql("ALTER TABLE metrics ALTER COLUMN score SET NOT NULL")
+        .unwrap_err();
+    assert!(set_not_null_err.to_string().contains("contain NULL values"));
+
+    engine
+        .execute_sql("UPDATE metrics SET score = 20 WHERE id = 2")
+        .unwrap();
+    engine
+        .execute_sql("ALTER TABLE metrics ALTER COLUMN score SET NOT NULL")
+        .unwrap();
+    let insert_null_err = engine
+        .execute_sql("INSERT INTO metrics (id, score) VALUES (3, NULL)")
+        .unwrap_err();
+    assert!(insert_null_err.to_string().contains("does not allow NULL"));
+
+    engine
+        .execute_sql("ALTER TABLE metrics ALTER COLUMN score DROP NOT NULL")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO metrics (id, score) VALUES (3, NULL)")
+        .unwrap();
+    let after_drop_not_null = engine
+        .execute_sql("SELECT id, score FROM metrics ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        after_drop_not_null,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "score".to_string()],
+            rows: vec![
+                vec![Value::BigInt(1), Value::Double(10.0)],
+                vec![Value::BigInt(2), Value::Double(20.0)],
+                vec![Value::BigInt(3), Value::Null],
+            ],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_alter_column_restrictions_and_upgrade_compatibility() {
+    let dir = unique_test_dir("sql-engine-alter-column-restrict");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT, CONSTRAINT fk_orders_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT ON UPDATE RESTRICT)",
+        )
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice')")
+        .unwrap();
+
+    let alter_pk_type_err = engine
+        .execute_sql("ALTER TABLE users ALTER COLUMN id TYPE INT")
+        .unwrap_err();
+    assert!(alter_pk_type_err.to_string().contains("used by constraint"));
+
+    let drop_pk_not_null_err = engine
+        .execute_sql("ALTER TABLE users ALTER COLUMN id DROP NOT NULL")
+        .unwrap_err();
+    assert!(
+        drop_pk_not_null_err
+            .to_string()
+            .contains("part of PRIMARY KEY")
+    );
+
+    drop(engine);
+
+    // Compatibility check: existing old-style directory can be reopened and migrated with B features.
+    let reopened = Engine::new(&base);
+    reopened
+        .execute_sql("ALTER TABLE users ADD COLUMN email VARCHAR")
+        .unwrap();
+    reopened
+        .execute_sql("RENAME TABLE users TO accounts")
+        .unwrap();
+    let rows = reopened
+        .execute_sql("SELECT id, name, email FROM accounts")
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string(), "email".to_string()],
+            rows: vec![vec![
+                Value::BigInt(1),
+                Value::Varchar("alice".to_string()),
+                Value::Null,
+            ]],
         }
     );
 

@@ -1,8 +1,9 @@
 use rusedb_core::{DataType, Result, RuseDbError};
 
 use crate::ast::{
-    AggregateFunction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem,
-    ReferenceDef, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp,
+    AggregateFunction, AlterColumnAction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause,
+    Literal, OrderByItem, ReferenceDef, SelectItem, Statement, TableConstraint,
+    TableConstraintKind, UnaryOp,
 };
 use crate::lexer::{Keyword, Token, TokenKind, lex, parse_error};
 
@@ -45,6 +46,8 @@ impl<'a> Parser<'a> {
             Some(Keyword::Show) => self.parse_show()?,
             Some(Keyword::Create) => self.parse_create()?,
             Some(Keyword::Drop) => self.parse_drop()?,
+            Some(Keyword::Alter) => self.parse_alter()?,
+            Some(Keyword::Rename) => self.parse_rename()?,
             Some(Keyword::Insert) => self.parse_insert()?,
             Some(Keyword::Select) => self.parse_select()?,
             Some(Keyword::Delete) => self.parse_delete()?,
@@ -76,6 +79,87 @@ impl<'a> Parser<'a> {
             Some(Keyword::Table) => self.parse_drop_table(),
             _ => Err(self.error_here("expected DATABASE or TABLE after DROP")),
         }
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let table = self.parse_identifier_path()?;
+
+        if self.consume_keyword(Keyword::Add) {
+            self.expect_keyword(Keyword::Column)?;
+            let column = self.parse_column_def()?;
+            return Ok(Statement::AlterTableAddColumn { table, column });
+        }
+
+        if self.consume_keyword(Keyword::Drop) {
+            self.expect_keyword(Keyword::Column)?;
+            let column = self.parse_identifier_path_segment()?;
+            return Ok(Statement::AlterTableDropColumn { table, column });
+        }
+
+        if self.consume_keyword(Keyword::Alter) {
+            self.expect_keyword(Keyword::Column)?;
+            let column = self.parse_identifier_path_segment()?;
+            let action = if self.consume_identifier_ci("TYPE") {
+                let type_name = self.parse_type_name()?;
+                AlterColumnAction::SetDataType(type_name.parse()?)
+            } else if self.consume_keyword(Keyword::Set) {
+                if self.consume_identifier_ci("DATA") {
+                    self.expect_identifier_ci("TYPE")?;
+                    let type_name = self.parse_type_name()?;
+                    AlterColumnAction::SetDataType(type_name.parse()?)
+                } else {
+                    self.expect_keyword(Keyword::Not)?;
+                    self.expect_keyword(Keyword::Null)?;
+                    AlterColumnAction::SetNotNull
+                }
+            } else if self.consume_keyword(Keyword::Drop) {
+                self.expect_keyword(Keyword::Not)?;
+                self.expect_keyword(Keyword::Null)?;
+                AlterColumnAction::DropNotNull
+            } else {
+                return Err(self.error_here(
+                    "expected TYPE, SET [DATA] TYPE, SET NOT NULL or DROP NOT NULL after ALTER COLUMN",
+                ));
+            };
+            return Ok(Statement::AlterTableAlterColumn {
+                table,
+                column,
+                action,
+            });
+        }
+
+        Err(self.error_here("expected ADD COLUMN, DROP COLUMN or ALTER COLUMN after ALTER TABLE"))
+    }
+
+    fn parse_rename(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Rename)?;
+        if self.consume_keyword(Keyword::Table) {
+            let old_name = self.parse_identifier_path()?;
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_identifier_path()?;
+            return Ok(Statement::RenameTable { old_name, new_name });
+        }
+        if self.consume_keyword(Keyword::Column) {
+            let first = self.parse_identifier_path()?;
+            let (table, old_name) = if self.peek_keyword() == Some(Keyword::To) {
+                split_qualified_column(&first)
+                    .ok_or_else(|| self.error_here("expected qualified name <table>.<column>"))?
+            } else {
+                let old_name = self.parse_identifier_path_segment()?;
+                (first, old_name)
+            };
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_identifier_path_segment()?;
+            return Ok(Statement::RenameColumn {
+                table,
+                old_name,
+                new_name,
+            });
+        }
+
+        Err(self.error_here("expected TABLE or COLUMN after RENAME"))
     }
 
     fn parse_create_database(&mut self) -> Result<Statement> {
@@ -706,6 +790,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn consume_identifier_ci(&mut self, expected: &str) -> bool {
+        let Some(token) = self.peek() else {
+            return false;
+        };
+        let TokenKind::Identifier(actual) = &token.kind else {
+            return false;
+        };
+        if actual.eq_ignore_ascii_case(expected) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_identifier_ci(&mut self, expected: &str) -> Result<()> {
+        if self.consume_identifier_ci(expected) {
+            Ok(())
+        } else {
+            Err(self.error_here(&format!("expected identifier {}", expected)))
+        }
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.cursor)
     }
@@ -759,4 +866,14 @@ fn parse_aggregate_function(name: &str) -> Option<AggregateFunction> {
         "MAX" => Some(AggregateFunction::Max),
         _ => None,
     }
+}
+
+fn split_qualified_column(input: &str) -> Option<(String, String)> {
+    let idx = input.rfind('.')?;
+    let table = input[..idx].trim();
+    let column = input[idx + 1..].trim();
+    if table.is_empty() || column.is_empty() {
+        return None;
+    }
+    Some((table.to_string(), column.to_string()))
 }

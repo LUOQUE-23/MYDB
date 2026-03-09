@@ -3,8 +3,9 @@ mod lexer;
 mod parser;
 
 pub use ast::{
-    AggregateFunction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem,
-    ReferenceDef, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp,
+    AggregateFunction, AlterColumnAction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause,
+    Literal, OrderByItem, ReferenceDef, SelectItem, Statement, TableConstraint,
+    TableConstraintKind, UnaryOp,
 };
 pub use lexer::{Keyword, Span, Token, TokenKind};
 pub use parser::parse_sql;
@@ -14,8 +15,9 @@ mod tests {
     use rusedb_core::DataType;
 
     use crate::{
-        AggregateFunction, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem, SelectItem,
-        Statement, TableConstraint, TableConstraintKind, UnaryOp, parse_sql,
+        AggregateFunction, AlterColumnAction, BinaryOp, ColumnDef, Expr, JoinClause, Literal,
+        OrderByItem, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp,
+        parse_sql,
     };
 
     #[test]
@@ -343,6 +345,91 @@ mod tests {
             parse_sql("DROP TABLE users").unwrap(),
             Statement::DropTable {
                 name: "users".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_alter_and_rename_statements() {
+        assert_eq!(
+            parse_sql("ALTER TABLE users ADD COLUMN age BIGINT").unwrap(),
+            Statement::AlterTableAddColumn {
+                table: "users".to_string(),
+                column: ColumnDef {
+                    name: "age".to_string(),
+                    data_type: DataType::BigInt,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    references: None,
+                },
+            }
+        );
+
+        assert_eq!(
+            parse_sql("ALTER TABLE users DROP COLUMN age").unwrap(),
+            Statement::AlterTableDropColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age TYPE DOUBLE").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::SetDataType(DataType::Double),
+            }
+        );
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age SET DATA TYPE BIGINT").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::SetDataType(DataType::BigInt),
+            }
+        );
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age SET NOT NULL").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::SetNotNull,
+            }
+        );
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age DROP NOT NULL").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::DropNotNull,
+            }
+        );
+
+        assert_eq!(
+            parse_sql("RENAME TABLE users TO app_users").unwrap(),
+            Statement::RenameTable {
+                old_name: "users".to_string(),
+                new_name: "app_users".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse_sql("RENAME COLUMN users.name TO full_name").unwrap(),
+            Statement::RenameColumn {
+                table: "users".to_string(),
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse_sql("RENAME COLUMN users name TO full_name").unwrap(),
+            Statement::RenameColumn {
+                table: "users".to_string(),
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
             }
         );
     }

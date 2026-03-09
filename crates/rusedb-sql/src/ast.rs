@@ -20,6 +20,28 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    AlterTableAddColumn {
+        table: String,
+        column: ColumnDef,
+    },
+    AlterTableDropColumn {
+        table: String,
+        column: String,
+    },
+    AlterTableAlterColumn {
+        table: String,
+        column: String,
+        action: AlterColumnAction,
+    },
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
+    RenameColumn {
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
@@ -53,6 +75,13 @@ pub enum Statement {
         assignments: Vec<Assignment>,
         selection: Option<Expr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterColumnAction {
+    SetDataType(DataType),
+    SetNotNull,
+    DropNotNull,
 }
 
 #[derive(Debug, Clone, PartialEq)]
