@@ -293,3 +293,27 @@ ps -ef | grep rusedb
 - 当前 `rusedb` 使用自定义 SQL 解析/执行与协议，不直接兼容 MySQL/PostgreSQL 驱动。
 - 若需给 Java/Python/Node/Go 等多语言使用，建议统一通过 HTTP API 接入。
 
+## 下一阶段更新：查询能力增强（P1）
+
+### C1. 谓词与表达式
+
+- [ ] `IN`
+- [ ] `LIKE`
+- [ ] `BETWEEN`
+- [ ] `IS NULL / IS NOT NULL`
+
+### C2. JOIN 与聚合
+
+- [ ] `LEFT JOIN`
+- [ ] `HAVING`
+- [ ] 聚合与分组边界场景测试
+
+### C3. 子查询（分阶段）
+
+- [ ] 第一阶段：`IN (SELECT ...)`
+- [ ] 第二阶段：标量子查询
+
+### C 验收标准
+
+- [ ] 常见业务 SQL 不需要大量在应用层改写
+- [ ] SQL 解析报错位置准确、信息可读
