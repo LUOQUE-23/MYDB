@@ -10,7 +10,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusedb_core::{Column, DataType, Result, RuseDbError, Value};
 use rusedb_exec::{Engine, Executor, QueryResult};
@@ -94,6 +94,23 @@ struct MigrationEntry {
     name: String,
     up_path: Option<PathBuf>,
     down_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupMode {
+    Offline,
+    Online,
+}
+
+#[derive(Debug)]
+struct BackupLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for BackupLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,6 +270,10 @@ fn run() -> Result<()> {
         Some("restore") => {
             let rest: Vec<String> = args.collect();
             cmd_restore(&rest)?;
+        }
+        Some("pitr") => {
+            let rest: Vec<String> = args.collect();
+            cmd_pitr(&rest)?;
         }
         Some("migrate") => {
             let rest: Vec<String> = args.collect();
@@ -449,25 +470,22 @@ fn cmd_connect(args: &[String]) -> Result<()> {
     if !auth_payload.is_empty() {
         println!("{auth_payload}");
     }
-    let mut line = String::new();
+    println!("tip: use ';' to end SQL, .help for commands");
     loop {
-        print!("rusedb@{}> ", addr);
-        io::stdout().flush()?;
-        line.clear();
-        if io::stdin().read_line(&mut line)? == 0 {
-            let _ = write_protocol_line(&mut stream, "QUIT");
-            break;
-        }
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
+        let prompt = format!("rusedb@{addr}> ");
+        let input = match read_interactive_sql_batch(&prompt, "......> ")? {
+            Some(sql) => sql,
+            None => {
+                let _ = write_protocol_line(&mut stream, "QUIT");
+                break;
+            }
+        };
         if input.eq_ignore_ascii_case(".exit") || input.eq_ignore_ascii_case(".quit") {
             let _ = write_protocol_line(&mut stream, "QUIT");
             break;
         }
 
-        let statements = split_sql_statements(input)?;
+        let statements = split_sql_statements(&input)?;
         for statement in statements {
             write_protocol_line(&mut stream, &format!("SQL {statement}"))?;
             let response = read_protocol_line(&mut reader)?.ok_or(RuseDbError::Parse(
@@ -566,7 +584,7 @@ fn execute_sql_batch(engine: &Arc<Mutex<Engine>>, sql: &str) -> Result<String> {
         let result = guard.execute_sql(&statement)?;
         out.push(render_query_result(&result));
     }
-    Ok(out.join("\n"))
+    Ok(out.join("\n\n"))
 }
 
 fn parse_auth_line(line: &str) -> Result<(String, String)> {
@@ -943,23 +961,119 @@ fn cmd_sql(args: &[String]) -> Result<()> {
 }
 
 fn cmd_backup(args: &[String]) -> Result<()> {
-    if args.len() != 2 {
+    if args.len() < 2 || args.len() > 4 {
         return Err(RuseDbError::Parse(
-            "usage: rusedb backup <catalog_base> <backup_dir>".to_string(),
+            "usage: rusedb backup <catalog_base> <backup_dir> [--online | --mode <offline|online>]"
+                .to_string(),
         ));
     }
     let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
     let backup_dir = absolute_path(PathBuf::from(&args[1]))?;
-    if backup_dir.exists() && fs::read_dir(&backup_dir)?.next().is_some() {
+    let mode = parse_backup_mode(&args[2..])?;
+
+    match mode {
+        BackupMode::Offline => {
+            perform_backup_copy(&catalog_base, &backup_dir, mode)?;
+        }
+        BackupMode::Online => {
+            let _lock = acquire_backup_lock(&catalog_base)?;
+            wait_for_active_transaction_clear(&catalog_base, Duration::from_secs(10))?;
+            perform_backup_copy(&catalog_base, &backup_dir, mode)?;
+        }
+    }
+
+    println!(
+        "ok: {} backup created at '{}'",
+        backup_mode_name(mode),
+        backup_dir.display()
+    );
+    Ok(())
+}
+
+fn cmd_restore(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb restore <backup_dir> <catalog_base>".to_string(),
+        ));
+    }
+    let backup_dir = absolute_path(PathBuf::from(&args[0]))?;
+    let target_base = absolute_path(PathBuf::from(&args[1]))?;
+    let restored = restore_backup_dir(&backup_dir, &target_base)?;
+    println!(
+        "ok: restore completed from '{}' to '{}' (files={restored})",
+        backup_dir.display(),
+        target_base.display()
+    );
+    Ok(())
+}
+
+fn cmd_pitr(args: &[String]) -> Result<()> {
+    if args.len() != 3 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb pitr <backup_root_dir> <catalog_base> <target_unix_ms>".to_string(),
+        ));
+    }
+    let backup_root = absolute_path(PathBuf::from(&args[0]))?;
+    let target_base = absolute_path(PathBuf::from(&args[1]))?;
+    let target_unix_ms = args[2].trim().parse::<u128>().map_err(|_| {
+        RuseDbError::Parse(format!(
+            "invalid target_unix_ms '{}': expected unix milliseconds",
+            args[2]
+        ))
+    })?;
+
+    let selected_backup = select_pitr_backup_dir(&backup_root, target_unix_ms)?;
+    let restored = restore_backup_dir(&selected_backup, &target_base)?;
+    println!(
+        "ok: pitr restored '{}' -> '{}' at target_unix_ms={} (selected='{}', files={restored})",
+        selected_backup.display(),
+        target_base.display(),
+        target_unix_ms,
+        selected_backup.display()
+    );
+    Ok(())
+}
+
+fn parse_backup_mode(extra_args: &[String]) -> Result<BackupMode> {
+    if extra_args.is_empty() {
+        return Ok(BackupMode::Offline);
+    }
+    if extra_args.len() == 1 && extra_args[0] == "--online" {
+        return Ok(BackupMode::Online);
+    }
+    if extra_args.len() == 2 && extra_args[0] == "--mode" {
+        return match extra_args[1].trim().to_ascii_lowercase().as_str() {
+            "offline" => Ok(BackupMode::Offline),
+            "online" => Ok(BackupMode::Online),
+            other => Err(RuseDbError::Parse(format!(
+                "invalid backup mode '{other}': expected offline or online"
+            ))),
+        };
+    }
+    Err(RuseDbError::Parse(
+        "usage: rusedb backup <catalog_base> <backup_dir> [--online | --mode <offline|online>]"
+            .to_string(),
+    ))
+}
+
+fn backup_mode_name(mode: BackupMode) -> &'static str {
+    match mode {
+        BackupMode::Offline => "offline",
+        BackupMode::Online => "online",
+    }
+}
+
+fn perform_backup_copy(catalog_base: &Path, backup_dir: &Path, mode: BackupMode) -> Result<usize> {
+    if backup_dir.exists() && fs::read_dir(backup_dir)?.next().is_some() {
         return Err(RuseDbError::Parse(format!(
             "backup target '{}' must be empty",
             backup_dir.display()
         )));
     }
-    fs::create_dir_all(&backup_dir)?;
+    fs::create_dir_all(backup_dir)?;
 
-    let (_, source_prefix) = family_dir_and_prefix_path(&catalog_base)?;
-    let family_files = list_catalog_family_files(&catalog_base)?;
+    let (_, source_prefix) = family_dir_and_prefix_path(catalog_base)?;
+    let family_files = list_catalog_family_files(catalog_base)?;
     if family_files.is_empty() {
         return Err(RuseDbError::NotFound {
             object: "catalog-files".to_string(),
@@ -981,28 +1095,17 @@ fn cmd_backup(args: &[String]) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let mode_label = backup_mode_name(mode);
     let manifest = format!(
-        "version=1\nsource_prefix={source_prefix}\nsource_base={}\ncreated_unix_ms={created_unix_ms}\nfiles={copied}\n",
+        "version=2\nmode={mode_label}\nsource_prefix={source_prefix}\nsource_base={}\ncreated_unix_ms={created_unix_ms}\nfiles={copied}\n",
         catalog_base.display()
     );
-    fs::write(backup_manifest_path(&backup_dir), manifest)?;
-
-    println!(
-        "ok: backup created at '{}' (files={copied})",
-        backup_dir.display()
-    );
-    Ok(())
+    fs::write(backup_manifest_path(backup_dir), manifest)?;
+    Ok(copied)
 }
 
-fn cmd_restore(args: &[String]) -> Result<()> {
-    if args.len() != 2 {
-        return Err(RuseDbError::Parse(
-            "usage: rusedb restore <backup_dir> <catalog_base>".to_string(),
-        ));
-    }
-    let backup_dir = absolute_path(PathBuf::from(&args[0]))?;
-    let target_base = absolute_path(PathBuf::from(&args[1]))?;
-    let manifest_path = backup_manifest_path(&backup_dir);
+fn restore_backup_dir(backup_dir: &Path, target_base: &Path) -> Result<usize> {
+    let manifest_path = backup_manifest_path(backup_dir);
     if !manifest_path.exists() {
         return Err(RuseDbError::NotFound {
             object: "backup-manifest".to_string(),
@@ -1013,11 +1116,11 @@ fn cmd_restore(args: &[String]) -> Result<()> {
     let manifest_pairs = parse_kv_config(&manifest_text)?;
     let source_prefix = required_kv(&manifest_pairs, "source_prefix")?;
 
-    let (target_dir, target_prefix) = family_dir_and_prefix_path(&target_base)?;
+    let (target_dir, target_prefix) = family_dir_and_prefix_path(target_base)?;
     fs::create_dir_all(&target_dir)?;
 
     let mut backup_files = Vec::new();
-    for entry in fs::read_dir(&backup_dir)? {
+    for entry in fs::read_dir(backup_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -1037,7 +1140,7 @@ fn cmd_restore(args: &[String]) -> Result<()> {
         });
     }
 
-    for old in list_catalog_family_files(&target_base)? {
+    for old in list_catalog_family_files(target_base)? {
         fs::remove_file(old)?;
     }
 
@@ -1054,12 +1157,134 @@ fn cmd_restore(args: &[String]) -> Result<()> {
         fs::copy(&src, target_dir.join(mapped))?;
         restored += 1;
     }
-    println!(
-        "ok: restore completed from '{}' to '{}' (files={restored})",
-        backup_dir.display(),
-        target_base.display()
-    );
-    Ok(())
+    Ok(restored)
+}
+
+fn select_pitr_backup_dir(backup_root: &Path, target_unix_ms: u128) -> Result<PathBuf> {
+    if !backup_root.exists() {
+        return Err(RuseDbError::NotFound {
+            object: "backup-root".to_string(),
+            name: backup_root.display().to_string(),
+        });
+    }
+    let mut candidates = Vec::<(u128, PathBuf)>::new();
+    if backup_manifest_path(backup_root).exists() {
+        if let Some(ts) = load_backup_created_unix_ms(backup_root)? {
+            if ts <= target_unix_ms {
+                candidates.push((ts, backup_root.to_path_buf()));
+            }
+        }
+    }
+    for entry in fs::read_dir(backup_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        if !backup_manifest_path(&dir).exists() {
+            continue;
+        }
+        if let Some(ts) = load_backup_created_unix_ms(&dir)? {
+            if ts <= target_unix_ms {
+                candidates.push((ts, dir));
+            }
+        }
+    }
+    let (_, selected) =
+        candidates
+            .into_iter()
+            .max_by_key(|(ts, _)| *ts)
+            .ok_or(RuseDbError::NotFound {
+                object: "pitr-backup".to_string(),
+                name: format!(
+                    "no backup <= target_unix_ms={} under '{}'",
+                    target_unix_ms,
+                    backup_root.display()
+                ),
+            })?;
+    Ok(selected)
+}
+
+fn load_backup_created_unix_ms(backup_dir: &Path) -> Result<Option<u128>> {
+    let manifest_path = backup_manifest_path(backup_dir);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(manifest_path)?;
+    let map = parse_kv_config(&text)?;
+    let raw = match map.get("created_unix_ms") {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let parsed = raw.parse::<u128>().map_err(|_| {
+        RuseDbError::Parse(format!(
+            "invalid created_unix_ms '{}' in backup manifest '{}'",
+            raw,
+            backup_dir.display()
+        ))
+    })?;
+    Ok(Some(parsed))
+}
+
+fn backup_lock_path(catalog_base: &Path) -> PathBuf {
+    family_sidecar_path(catalog_base, "backup.lock")
+}
+
+fn acquire_backup_lock(catalog_base: &Path) -> Result<BackupLockGuard> {
+    let lock_path = backup_lock_path(catalog_base);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                RuseDbError::Parse(format!(
+                    "online backup already in progress for '{}'",
+                    catalog_base.display()
+                ))
+            } else {
+                RuseDbError::Io(err)
+            }
+        })?;
+    let created_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    writeln!(file, "pid={}", process::id())?;
+    writeln!(file, "created_unix_ms={created_unix_ms}")?;
+    file.flush()?;
+    Ok(BackupLockGuard { path: lock_path })
+}
+
+fn wal_has_active_transaction(catalog_base: &Path) -> Result<bool> {
+    let wal_path = family_sidecar_path(catalog_base, "wal");
+    if !wal_path.exists() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(wal_path)?;
+    Ok(content
+        .lines()
+        .any(|line| line.trim_start().starts_with("BEGIN ")))
+}
+
+fn wait_for_active_transaction_clear(catalog_base: &Path, timeout: Duration) -> Result<()> {
+    let start = SystemTime::now();
+    loop {
+        if !wal_has_active_transaction(catalog_base)? {
+            return Ok(());
+        }
+        let elapsed = start.elapsed().unwrap_or(Duration::from_secs(0));
+        if elapsed >= timeout {
+            return Err(RuseDbError::Parse(format!(
+                "online backup wait timeout after {} ms: active transaction still running",
+                timeout.as_millis()
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn cmd_migrate(args: &[String]) -> Result<()> {
@@ -1362,22 +1587,12 @@ fn cmd_shell(args: &[String]) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         base
     );
-    let mut line = String::new();
+    println!("tip: use ';' to end SQL, .help for commands");
     loop {
-        print!("rusedb> ");
-        io::stdout().flush()?;
-        line.clear();
-        if io::stdin().read_line(&mut line)? == 0 {
+        let Some(input) = read_interactive_sql_batch("rusedb> ", "......> ")? else {
             break;
-        }
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input.eq_ignore_ascii_case(".exit") || input.eq_ignore_ascii_case(".quit") {
-            break;
-        }
-        let statements = split_sql_statements(input)?;
+        };
+        let statements = split_sql_statements(&input)?;
         for statement in statements {
             match engine.execute_sql(&statement) {
                 Ok(result) => print_query_result(result),
@@ -3167,8 +3382,9 @@ fn print_usage() {
     println!("  rusedb describe <catalog_base> <table_name>");
     println!("  rusedb parse-sql <sql>");
     println!("  rusedb sql <catalog_base> <sql-or-batch>");
-    println!("  rusedb backup <catalog_base> <backup_dir>");
+    println!("  rusedb backup <catalog_base> <backup_dir> [--online | --mode <offline|online>]");
     println!("  rusedb restore <backup_dir> <catalog_base>");
+    println!("  rusedb pitr <backup_root_dir> <catalog_base> <target_unix_ms>");
     println!("  rusedb migrate up <catalog_base> <migrations_dir>");
     println!("  rusedb migrate down <catalog_base> <migrations_dir> <steps>");
     println!("  rusedb user-add <catalog_base> <username> <token>");
@@ -3189,15 +3405,7 @@ fn render_query_result(result: &QueryResult) -> String {
     match result {
         QueryResult::AffectedRows(count) => format!("ok: {count} row(s) affected"),
         QueryResult::Message(message) => format!("ok: {message}"),
-        QueryResult::Rows { columns, rows } => {
-            let mut lines = Vec::with_capacity(rows.len() + 1);
-            lines.push(columns.join("\t"));
-            for row in rows {
-                let cells: Vec<String> = row.iter().map(format_value).collect();
-                lines.push(cells.join("\t"));
-            }
-            lines.join("\n")
-        }
+        QueryResult::Rows { columns, rows } => render_rows_table(columns, rows),
     }
 }
 
@@ -3210,6 +3418,215 @@ fn format_value(value: &Value) -> String {
         Value::Varchar(v) => v.clone(),
         Value::Null => "NULL".to_string(),
     }
+}
+
+fn read_interactive_sql_batch(
+    primary_prompt: &str,
+    continue_prompt: &str,
+) -> Result<Option<String>> {
+    let mut sql_buffer = String::new();
+    loop {
+        let prompt = if sql_buffer.trim().is_empty() {
+            primary_prompt
+        } else {
+            continue_prompt
+        };
+        print!("{prompt}");
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            if sql_buffer.trim().is_empty() {
+                return Ok(None);
+            }
+            return Err(RuseDbError::Parse(
+                "input ended before SQL terminator ';'".to_string(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case(".help") {
+            print_interactive_help();
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case(".exit") || trimmed.eq_ignore_ascii_case(".quit") {
+            if sql_buffer.trim().is_empty() {
+                return Ok(None);
+            }
+            return Err(RuseDbError::Parse(
+                "pending SQL not executed; use ';' to run or .clear to discard".to_string(),
+            ));
+        }
+        if sql_buffer.trim().is_empty() && trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case(".clear") {
+            sql_buffer.clear();
+            println!("cleared pending SQL input");
+            continue;
+        }
+        sql_buffer.push_str(&line);
+        if sql_batch_is_terminated(&sql_buffer) {
+            return Ok(Some(sql_buffer.trim().to_string()));
+        }
+    }
+}
+
+fn print_interactive_help() {
+    println!(".help                show this help");
+    println!(".clear               clear current multi-line SQL buffer");
+    println!(".exit / .quit        exit shell");
+    println!("SQL terminator       use ';' to execute");
+    println!("multi-line SQL       continue input until final ';'");
+}
+
+fn sql_batch_is_terminated(sql: &str) -> bool {
+    let mut in_string = false;
+    let mut chars = sql.chars().peekable();
+    let mut last_significant: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if in_string {
+                if matches!(chars.peek(), Some('\'')) {
+                    let _ = chars.next();
+                } else {
+                    in_string = false;
+                }
+            } else {
+                in_string = true;
+            }
+            continue;
+        }
+        if in_string || ch.is_whitespace() {
+            continue;
+        }
+        last_significant = Some(ch);
+    }
+    !in_string && matches!(last_significant, Some(';'))
+}
+
+fn string_display_width(input: &str) -> usize {
+    input
+        .chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn normalize_table_cell(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn truncate_to_display_width(input: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let total = string_display_width(input);
+    if total <= width {
+        return input.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let target = width - 3;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in input.chars() {
+        let w = if ch.is_ascii() { 1 } else { 2 };
+        if used + w > target {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push_str("...");
+    out
+}
+
+fn pad_display_width(input: &str, width: usize) -> String {
+    let used = string_display_width(input);
+    if used >= width {
+        return input.to_string();
+    }
+    format!("{input}{}", " ".repeat(width - used))
+}
+
+fn render_table_border(widths: &[usize]) -> String {
+    let mut out = String::new();
+    out.push('+');
+    for width in widths {
+        out.push_str(&"-".repeat(*width + 2));
+        out.push('+');
+    }
+    out
+}
+
+fn render_table_row(cells: &[String], widths: &[usize]) -> String {
+    let mut out = String::new();
+    out.push('|');
+    for (idx, width) in widths.iter().enumerate() {
+        let raw = cells.get(idx).cloned().unwrap_or_default();
+        let clipped = truncate_to_display_width(&normalize_table_cell(&raw), *width);
+        let padded = pad_display_width(&clipped, *width);
+        out.push(' ');
+        out.push_str(&padded);
+        out.push(' ');
+        out.push('|');
+    }
+    out
+}
+
+fn render_rows_table(columns: &[String], rows: &[Vec<Value>]) -> String {
+    if columns.is_empty() {
+        return "(ok)".to_string();
+    }
+    const MAX_COL_WIDTH: usize = 48;
+    let mut text_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut cells = Vec::with_capacity(row.len());
+        for value in row {
+            cells.push(format_value(value));
+        }
+        text_rows.push(cells);
+    }
+
+    let mut widths = columns
+        .iter()
+        .map(|col| string_display_width(&normalize_table_cell(col)).min(MAX_COL_WIDTH))
+        .collect::<Vec<_>>();
+    for row in &text_rows {
+        for (idx, cell) in row.iter().enumerate() {
+            if idx >= widths.len() {
+                continue;
+            }
+            let width = string_display_width(&normalize_table_cell(cell)).min(MAX_COL_WIDTH);
+            if width > widths[idx] {
+                widths[idx] = width;
+            }
+        }
+    }
+    for width in &mut widths {
+        if *width == 0 {
+            *width = 1;
+        }
+    }
+
+    let mut lines = Vec::new();
+    let border = render_table_border(&widths);
+    lines.push(border.clone());
+    lines.push(render_table_row(
+        &columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        &widths,
+    ));
+    lines.push(border.clone());
+    for row in text_rows {
+        lines.push(render_table_row(&row, &widths));
+    }
+    lines.push(border);
+    lines.push(format!("({} row(s))", rows.len()));
+    lines.join("\n")
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
@@ -3256,14 +3673,29 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AuthenticatedUser, PermissionRequirement, RbacAction, RbacGrant, RbacScope, RbacUser,
-        first_missing_requirement, parse_actions_csv, parse_migration_file_name,
-        parse_rbac_scope_token, parse_sql, permission_requirements_for_statements,
-        remap_family_file_prefix, split_request_path_and_query, split_sql_statements,
-        upsert_user_grant,
+        AuthenticatedUser, BackupMode, PermissionRequirement, RbacAction, RbacGrant, RbacScope,
+        RbacUser, backup_manifest_path, first_missing_requirement, parse_actions_csv,
+        parse_backup_mode, parse_migration_file_name, parse_rbac_scope_token, parse_sql,
+        permission_requirements_for_statements, remap_family_file_prefix, render_rows_table,
+        select_pitr_backup_dir, split_request_path_and_query, split_sql_statements,
+        sql_batch_is_terminated, upsert_user_grant,
     };
+    use rusedb_core::Value;
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rusedb-server-{prefix}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn parse_migration_filename_works() {
@@ -3396,5 +3828,75 @@ mod tests {
         ];
         let missing = first_missing_requirement(&user, &requirements).unwrap();
         assert_eq!(missing.action, RbacAction::Delete);
+    }
+
+    #[test]
+    fn parse_backup_mode_works() {
+        assert_eq!(parse_backup_mode(&[]).unwrap(), BackupMode::Offline);
+        assert_eq!(
+            parse_backup_mode(&["--online".to_string()]).unwrap(),
+            BackupMode::Online
+        );
+        assert_eq!(
+            parse_backup_mode(&["--mode".to_string(), "offline".to_string()]).unwrap(),
+            BackupMode::Offline
+        );
+        assert!(parse_backup_mode(&["--mode".to_string(), "x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn pitr_selects_latest_snapshot_before_target() {
+        let root = temp_dir("pitr");
+        let old = root.join("b1");
+        let mid = root.join("b2");
+        let new = root.join("b3");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&mid).unwrap();
+        fs::create_dir_all(&new).unwrap();
+
+        fs::write(
+            backup_manifest_path(&old),
+            "version=2\ncreated_unix_ms=1000\nsource_prefix=rusedb\n",
+        )
+        .unwrap();
+        fs::write(
+            backup_manifest_path(&mid),
+            "version=2\ncreated_unix_ms=2000\nsource_prefix=rusedb\n",
+        )
+        .unwrap();
+        fs::write(
+            backup_manifest_path(&new),
+            "version=2\ncreated_unix_ms=3000\nsource_prefix=rusedb\n",
+        )
+        .unwrap();
+
+        let selected = select_pitr_backup_dir(&root, 2500).unwrap();
+        assert_eq!(selected, mid);
+        assert!(select_pitr_backup_dir(&root, 900).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sql_batch_terminated_detection_works() {
+        assert!(!sql_batch_is_terminated("SELECT * FROM t"));
+        assert!(sql_batch_is_terminated("SELECT * FROM t;"));
+        assert!(sql_batch_is_terminated("SELECT ';' AS s;"));
+        assert!(!sql_batch_is_terminated("SELECT ';' AS s"));
+        assert!(!sql_batch_is_terminated("SELECT 'unterminated"));
+    }
+
+    #[test]
+    fn render_rows_table_truncates_long_cells() {
+        let columns = vec!["id".to_string(), "desc".to_string()];
+        let rows = vec![vec![
+            Value::BigInt(1),
+            Value::Varchar("a very very very very very very very very long text".to_string()),
+        ]];
+        let rendered = render_rows_table(&columns, &rows);
+        assert!(rendered.contains("+"));
+        assert!(rendered.contains("| id "));
+        assert!(rendered.contains("..."));
+        assert!(rendered.contains("(1 row(s))"));
     }
 }

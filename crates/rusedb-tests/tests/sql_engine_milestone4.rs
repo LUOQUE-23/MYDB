@@ -39,6 +39,12 @@ fn slow_log_file_path(base: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+fn backup_lock_file_path(base: &Path) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(".backup.lock");
+    PathBuf::from(os)
+}
+
 fn active_begin_tx_id(base: &Path) -> u64 {
     let content = fs::read_to_string(wal_file_path(base)).unwrap();
     for line in content.lines() {
@@ -313,6 +319,31 @@ fn sql_engine_lock_wait_timeout_for_concurrent_writer() {
 
     release_tx.send(()).unwrap();
     holder.join().unwrap();
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_backup_lock_blocks_new_mutations() {
+    let dir = unique_test_dir("sql-engine-backup-lock");
+    let base = dir.join("rusedb");
+    let engine = Engine::new_with_lock_wait_timeout(&base, Duration::from_millis(120));
+
+    engine
+        .execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+        .unwrap();
+
+    fs::write(backup_lock_file_path(&base), "pid=1\n").unwrap();
+    let err = engine
+        .execute_sql("INSERT INTO items (id) VALUES (1)")
+        .unwrap_err();
+    assert!(err.to_string().contains("backup lock wait timeout"));
+
+    fs::remove_file(backup_lock_file_path(&base)).unwrap();
+    let inserted = engine
+        .execute_sql("INSERT INTO items (id) VALUES (1)")
+        .unwrap();
+    assert_eq!(inserted, QueryResult::AffectedRows(1));
 
     cleanup_dir(&dir);
 }
@@ -1061,6 +1092,44 @@ fn sql_engine_unique_constraint_update_conflict_and_multi_column() {
         duplicate_pair
             .to_string()
             .contains("duplicate key violates UNIQUE constraint")
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_unique_constraint_conflict_inside_transaction() {
+    let dir = unique_test_dir("sql-engine-constraints-tx-conflict");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email VARCHAR, CONSTRAINT uq_users_email UNIQUE (email))",
+        )
+        .unwrap();
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, email) VALUES (1, 'a@x.com')")
+        .unwrap();
+    let tx_conflict = engine
+        .execute_sql("INSERT INTO users (id, email) VALUES (2, 'a@x.com')")
+        .unwrap_err();
+    assert!(
+        tx_conflict
+            .to_string()
+            .contains("duplicate key violates UNIQUE constraint")
+    );
+    engine.execute_sql("ROLLBACK").unwrap();
+
+    let rows = engine.execute_sql("SELECT * FROM users").unwrap();
+    assert_eq!(
+        rows,
+        QueryResult::Rows {
+            columns: vec!["id".to_string(), "email".to_string()],
+            rows: vec![],
+        }
     );
 
     cleanup_dir(&dir);

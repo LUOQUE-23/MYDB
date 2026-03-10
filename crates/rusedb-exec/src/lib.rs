@@ -37,6 +37,7 @@ pub trait Executor {
 const DEFAULT_DATABASE_NAME: &str = "default";
 const DEFAULT_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_SLOW_QUERY_THRESHOLD: Duration = Duration::from_millis(200);
+const BACKUP_LOCK_WAIT_POLL: Duration = Duration::from_millis(25);
 const ISOLATION_LEVEL: &str = "READ COMMITTED";
 const WAL_MAGIC: &str = "WAL";
 const WAL_VERSION: u32 = 1;
@@ -178,6 +179,9 @@ impl Engine {
 
     pub fn execute_statement(&self, statement: Statement) -> Result<QueryResult> {
         self.ensure_recovered()?;
+        if statement_requires_backup_lock_wait(&statement) {
+            self.wait_for_backup_lock_release_for_statement(&statement)?;
+        }
         match statement {
             Statement::Begin => self.begin_transaction(),
             Statement::Commit => self.commit_transaction(),
@@ -1535,6 +1539,16 @@ impl Engine {
         self.database_base_for_name(&current_db)
     }
 
+    fn wait_for_backup_lock_release_for_statement(&self, statement: &Statement) -> Result<()> {
+        let lock_base = match statement {
+            Statement::CreateDatabase { .. } | Statement::DropDatabase { .. } => {
+                self.catalog_base.clone()
+            }
+            _ => self.current_live_base()?,
+        };
+        wait_for_backup_lock_release(&lock_base, self.lock_wait_timeout)
+    }
+
     fn database_base_for_name(&self, db_name: &str) -> Result<PathBuf> {
         if db_name == DEFAULT_DATABASE_NAME {
             return Ok(self.catalog_base.clone());
@@ -1616,6 +1630,16 @@ impl Executor for Engine {
     }
 }
 
+fn statement_requires_backup_lock_wait(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Begin
+            | Statement::AnalyzeTable { .. }
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
+    ) || is_mutating_statement(statement)
+}
+
 fn is_mutating_statement(statement: &Statement) -> bool {
     matches!(
         statement,
@@ -1638,6 +1662,31 @@ fn lock_wait_timeout_error(timeout: Duration) -> RuseDbError {
         "lock wait timeout after {} ms while waiting for transaction lock",
         timeout.as_millis()
     ))
+}
+
+fn backup_lock_wait_timeout_error(timeout: Duration) -> RuseDbError {
+    RuseDbError::Parse(format!(
+        "backup lock wait timeout after {} ms while waiting for online backup to finish",
+        timeout.as_millis()
+    ))
+}
+
+fn backup_lock_path(base: &Path) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(".backup.lock");
+    PathBuf::from(os)
+}
+
+fn wait_for_backup_lock_release(base: &Path, timeout: Duration) -> Result<()> {
+    let lock_path = backup_lock_path(base);
+    let start = Instant::now();
+    while lock_path.exists() {
+        if start.elapsed() >= timeout {
+            return Err(backup_lock_wait_timeout_error(timeout));
+        }
+        std::thread::sleep(BACKUP_LOCK_WAIT_POLL);
+    }
+    Ok(())
 }
 
 fn normalize_database_name(name: &str) -> Result<String> {

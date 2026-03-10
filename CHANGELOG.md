@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- F1 backup enhancements:
+  - `rusedb backup <catalog_base> <backup_dir> --online`
+  - backup mode parsing (`offline` / `online`)
+  - online backup lock coordination (`<catalog_base>.backup.lock`)
+- PITR phase 1:
+  - `rusedb pitr <backup_root_dir> <catalog_base> <target_unix_ms>`
+  - selects latest snapshot where `created_unix_ms <= target_unix_ms`
+- New docs:
+  - `docs/sql-support-matrix.md`
+  - `docs/error-codes.md`
+
+### Changed
+
+- Engine write-entry path now waits when backup lock exists.
+- Added regression tests for:
+  - backup lock blocking new mutations
+  - unique conflict inside transaction rollback path
+
+## v1.2.1 (2026-03-10)
+
+本版本定位为基础内核稳定发布版本。
+
+### 发布说明
+
+- 当前版本已基本实现数据库最简运行需求：
+  - 基础 SQL（建库建表、增删改查、常见查询）
+  - 基础事务与 WAL 恢复
+  - CLI/TCP/HTTP 接入能力
+- 后续版本将重点演进：
+  - 高并发能力
+  - 高安全能力
+  - 高可用能力
+
 ## v1.2.0 (2026-03-10)
 
 本版本聚焦 Milestone C/D/E 以及 Milestone F 的部分能力，重点提升 SQL 表达力、事务恢复、可观测性与运维接入能力。
