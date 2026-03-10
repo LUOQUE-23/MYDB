@@ -1,10 +1,10 @@
-﻿# RuseDB
+# RuseDB
 
 ![RuseDB Logo](./RuseDB_LOGO.png)
 
 `RuseDB` 是一个用 Rust 实现的个人数据库项目，目标是做到本地可用、可持续迭代、便于跨语言接入。
 
-当前版本：`RuseDB V1.0.1`
+当前版本：`RuseDB V1.2.0`
 
 ## 当前已实现功能
 
@@ -21,11 +21,6 @@
   - `UNIQUE`（列级/表级，支持多列）
   - `FOREIGN KEY ... REFERENCES ...`（支持 `RESTRICT`）
   - `DROP TABLE ...`
-  - `ALTER TABLE ... ADD COLUMN ...`
-  - `ALTER TABLE ... DROP COLUMN ...`（受限规则）
-  - `ALTER TABLE ... ALTER COLUMN ...`（类型/空约束受限变更）
-  - `RENAME TABLE ... TO ...`
-  - `RENAME COLUMN ... TO ...`
   - `SHOW TABLES`
   - `CREATE INDEX ... ON ...(...)`
 - 数据操作：

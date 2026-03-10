@@ -1,4 +1,7 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use std::{fs, thread, time};
 
 use rusedb_core::Value;
@@ -22,6 +25,29 @@ fn cleanup_dir(path: &Path) {
         }
         thread::sleep(time::Duration::from_millis(50));
     }
+}
+
+fn wal_file_path(base: &Path) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(".wal");
+    PathBuf::from(os)
+}
+
+fn slow_log_file_path(base: &Path) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(".slowlog");
+    PathBuf::from(os)
+}
+
+fn active_begin_tx_id(base: &Path) -> u64 {
+    let content = fs::read_to_string(wal_file_path(base)).unwrap();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(tx_id_raw) = trimmed.strip_prefix("BEGIN ") {
+            return tx_id_raw.parse::<u64>().unwrap();
+        }
+    }
+    panic!("no BEGIN record found in WAL");
 }
 
 #[test]
@@ -202,6 +228,270 @@ fn sql_engine_transaction_commit_rollback_and_recovery() {
 }
 
 #[test]
+fn sql_engine_read_committed_for_non_owner_reader() {
+    let dir = unique_test_dir("sql-engine-read-committed");
+    let base = dir.join("rusedb");
+    let engine = Arc::new(Engine::new(&base));
+
+    engine
+        .execute_sql("CREATE TABLE accounts (id BIGINT NOT NULL, balance BIGINT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO accounts (id, balance) VALUES (1, 10)")
+        .unwrap();
+
+    let (updated_tx, updated_rx) = mpsc::channel();
+    let (commit_tx, commit_rx) = mpsc::channel();
+    let writer_engine = Arc::clone(&engine);
+    let writer = thread::spawn(move || {
+        writer_engine.execute_sql("BEGIN").unwrap();
+        writer_engine
+            .execute_sql("UPDATE accounts SET balance = 20 WHERE id = 1")
+            .unwrap();
+        updated_tx.send(()).unwrap();
+        commit_rx.recv().unwrap();
+        writer_engine.execute_sql("COMMIT").unwrap();
+    });
+
+    updated_rx.recv().unwrap();
+    let before_commit = engine
+        .execute_sql("SELECT balance FROM accounts WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        before_commit,
+        QueryResult::Rows {
+            columns: vec!["balance".to_string()],
+            rows: vec![vec![Value::BigInt(10)]],
+        }
+    );
+
+    commit_tx.send(()).unwrap();
+    writer.join().unwrap();
+
+    let after_commit = engine
+        .execute_sql("SELECT balance FROM accounts WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        after_commit,
+        QueryResult::Rows {
+            columns: vec!["balance".to_string()],
+            rows: vec![vec![Value::BigInt(20)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_lock_wait_timeout_for_concurrent_writer() {
+    let dir = unique_test_dir("sql-engine-lock-timeout");
+    let base = dir.join("rusedb");
+    let engine = Arc::new(Engine::new_with_lock_wait_timeout(
+        &base,
+        Duration::from_millis(150),
+    ));
+
+    engine
+        .execute_sql("CREATE TABLE items (id BIGINT NOT NULL)")
+        .unwrap();
+
+    let (begun_tx, begun_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder_engine = Arc::clone(&engine);
+    let holder = thread::spawn(move || {
+        holder_engine.execute_sql("BEGIN").unwrap();
+        begun_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        holder_engine.execute_sql("ROLLBACK").unwrap();
+    });
+
+    begun_rx.recv().unwrap();
+    let err = engine
+        .execute_sql("INSERT INTO items (id) VALUES (1)")
+        .unwrap_err();
+    assert!(err.to_string().contains("lock wait timeout"));
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_wal_commit_start_recovery_applies_tx_files() {
+    let dir = unique_test_dir("sql-engine-wal-commit-start");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL, value BIGINT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, value) VALUES (1, 10)")
+        .unwrap();
+    engine.execute_sql("BEGIN").unwrap();
+    engine
+        .execute_sql("UPDATE t SET value = 20 WHERE id = 1")
+        .unwrap();
+
+    let tx_id = active_begin_tx_id(&base);
+    let mut wal_file = fs::OpenOptions::new()
+        .append(true)
+        .open(wal_file_path(&base))
+        .unwrap();
+    writeln!(wal_file, "COMMIT_START {tx_id}").unwrap();
+    wal_file.flush().unwrap();
+    drop(engine);
+
+    let recovered = Engine::new(&base);
+    let result = recovered
+        .execute_sql("SELECT value FROM t WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        result,
+        QueryResult::Rows {
+            columns: vec!["value".to_string()],
+            rows: vec![vec![Value::BigInt(20)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_wal_checkpoint_and_legacy_format_are_supported() {
+    let dir = unique_test_dir("sql-engine-wal-checkpoint-legacy");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE t (id BIGINT NOT NULL, value BIGINT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO t (id, value) VALUES (1, 10)")
+        .unwrap();
+
+    let wal_after_commit = fs::read_to_string(wal_file_path(&base)).unwrap();
+    assert!(wal_after_commit.contains("WAL 1"));
+    assert!(wal_after_commit.contains("CHECKPOINT"));
+    assert!(!wal_after_commit.contains("COMMIT_START"));
+
+    engine.execute_sql("BEGIN").unwrap();
+    engine
+        .execute_sql("UPDATE t SET value = 30 WHERE id = 1")
+        .unwrap();
+    let tx_id = active_begin_tx_id(&base);
+    fs::write(
+        wal_file_path(&base),
+        format!("BEGIN {tx_id}\nCOMMIT_START {tx_id}\n"),
+    )
+    .unwrap();
+    drop(engine);
+
+    let recovered = Engine::new(&base);
+    let result = recovered
+        .execute_sql("SELECT value FROM t WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        result,
+        QueryResult::Rows {
+            columns: vec!["value".to_string()],
+            rows: vec![vec![Value::BigInt(30)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_explain_analyze_and_stats_work() {
+    let dir = unique_test_dir("sql-engine-explain-stats");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, score BIGINT)")
+        .unwrap();
+    engine
+        .execute_sql("CREATE INDEX idx_users_id ON users (id)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, score) VALUES (1, 10), (2, NULL), (3, 10)")
+        .unwrap();
+
+    let analyzed = engine.execute_sql("ANALYZE TABLE users").unwrap();
+    assert!(matches!(analyzed, QueryResult::Message(_)));
+
+    let explain = engine
+        .execute_sql("EXPLAIN SELECT id FROM users WHERE id = 2")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = explain else {
+        panic!("EXPLAIN should return rows");
+    };
+    let mut map = std::collections::HashMap::<String, String>::new();
+    for row in rows {
+        let key = match &row[0] {
+            Value::Varchar(v) => v.clone(),
+            other => format!("{other:?}"),
+        };
+        let value = match &row[1] {
+            Value::Varchar(v) => v.clone(),
+            other => format!("{other:?}"),
+        };
+        map.insert(key, value);
+    }
+    assert!(map.get("access_path").unwrap().contains("INDEX"));
+    assert!(map.contains_key("table_rows"));
+    assert!(map.contains_key("estimated_rows"));
+    assert!(map.contains_key("predicate_column_stats"));
+
+    let explain_analyze = engine
+        .execute_sql("EXPLAIN ANALYZE SELECT id FROM users WHERE id = 2")
+        .unwrap();
+    let QueryResult::Rows {
+        rows: analyze_rows, ..
+    } = explain_analyze
+    else {
+        panic!("EXPLAIN ANALYZE should return rows");
+    };
+    let analyze_items = analyze_rows
+        .into_iter()
+        .filter_map(|row| match &row[0] {
+            Value::Varchar(key) => Some(key.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert!(analyze_items.contains("analyze_elapsed_ms"));
+    assert!(analyze_items.contains("analyze_scanned_rows"));
+    assert!(analyze_items.contains("analyze_output_rows"));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_slow_query_log_records_metrics() {
+    let dir = unique_test_dir("sql-engine-slow-log");
+    let base = dir.join("rusedb");
+    let engine = Engine::new_with_timeouts(&base, Duration::from_secs(3), Duration::from_millis(0));
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice')")
+        .unwrap();
+    let _ = engine
+        .execute_sql("SELECT id, name FROM users WHERE id = 1")
+        .unwrap();
+
+    let log = fs::read_to_string(slow_log_file_path(&base)).unwrap();
+    assert!(log.contains("SELECT id, name FROM users WHERE id = 1"));
+    assert!(log.contains("rows=1"));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
 fn sql_engine_join_group_and_aggregate() {
     let dir = unique_test_dir("sql-engine-join-group");
     let base = dir.join("rusedb");
@@ -259,6 +549,243 @@ fn sql_engine_join_group_and_aggregate() {
                 ],
             ],
         }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_predicate_extensions_work() {
+    let dir = unique_test_dir("sql-engine-predicate-extensions");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql(
+            "CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR, score BIGINT, deleted_at BIGINT)",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO users (id, name, score, deleted_at) VALUES \
+             (1, 'alice', 15, NULL), \
+             (2, 'alex', 9, NULL), \
+             (3, 'bob', 20, 1), \
+             (4, 'anna', 18, NULL)",
+        )
+        .unwrap();
+
+    let filtered = engine
+        .execute_sql(
+            "SELECT id FROM users \
+             WHERE name LIKE 'a%' \
+               AND id IN (1, 2, 4) \
+               AND score BETWEEN 10 AND 20 \
+               AND deleted_at IS NULL \
+             ORDER BY id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        filtered,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(1)], vec![Value::BigInt(4)]],
+        }
+    );
+
+    let not_null = engine
+        .execute_sql("SELECT id FROM users WHERE deleted_at IS NOT NULL ORDER BY id ASC")
+        .unwrap();
+    assert_eq!(
+        not_null,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(3)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_left_join_and_having_work() {
+    let dir = unique_test_dir("sql-engine-left-join-having");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("CREATE TABLE orders (id BIGINT NOT NULL, user_id BIGINT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO orders (id, user_id) VALUES (10, 1), (11, 1), (12, 2)")
+        .unwrap();
+
+    let joined = engine
+        .execute_sql(
+            "SELECT users.id, COUNT(orders.id) \
+             FROM users LEFT JOIN orders ON users.id = orders.user_id \
+             GROUP BY users.id \
+             ORDER BY users.id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        joined,
+        QueryResult::Rows {
+            columns: vec!["users.id".to_string(), "count(orders.id)".to_string()],
+            rows: vec![
+                vec![Value::BigInt(1), Value::BigInt(2)],
+                vec![Value::BigInt(2), Value::BigInt(1)],
+                vec![Value::BigInt(3), Value::BigInt(0)],
+            ],
+        }
+    );
+
+    let having = engine
+        .execute_sql(
+            "SELECT users.id, COUNT(orders.id) \
+             FROM users LEFT JOIN orders ON users.id = orders.user_id \
+             GROUP BY users.id \
+             HAVING COUNT(orders.id) > 1 \
+             ORDER BY users.id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        having,
+        QueryResult::Rows {
+            columns: vec!["users.id".to_string(), "count(orders.id)".to_string()],
+            rows: vec![vec![Value::BigInt(1), Value::BigInt(2)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_in_subquery_first_stage_works() {
+    let dir = unique_test_dir("sql-engine-in-subquery");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("CREATE TABLE orders (id BIGINT NOT NULL, user_id BIGINT, amount BIGINT)")
+        .unwrap();
+
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO orders (id, user_id, amount) VALUES (10, 1, 100), (11, 2, 5), (12, 1, 20)",
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql(
+            "SELECT id FROM users \
+             WHERE id IN (SELECT user_id FROM orders WHERE amount >= 20) \
+             ORDER BY id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(1)]],
+        }
+    );
+
+    let not_in_result = engine
+        .execute_sql(
+            "SELECT id FROM users \
+             WHERE id NOT IN (SELECT user_id FROM orders WHERE amount >= 20) \
+             ORDER BY id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        not_in_result,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(2)], vec![Value::BigInt(3)]],
+        }
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sql_engine_scalar_subquery_second_stage_works() {
+    let dir = unique_test_dir("sql-engine-scalar-subquery");
+    let base = dir.join("rusedb");
+    let engine = Engine::new(&base);
+
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR)")
+        .unwrap();
+    engine
+        .execute_sql("CREATE TABLE orders (id BIGINT NOT NULL, user_id BIGINT, amount BIGINT)")
+        .unwrap();
+
+    engine
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO orders (id, user_id, amount) VALUES (10, 1, 100), (11, 2, 5), (12, 1, 20)",
+        )
+        .unwrap();
+
+    let single_row = engine
+        .execute_sql(
+            "SELECT id FROM users \
+             WHERE id = (SELECT user_id FROM orders WHERE id = 10) \
+             ORDER BY id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        single_row,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Value::BigInt(1)]],
+        }
+    );
+
+    let null_subquery = engine
+        .execute_sql(
+            "SELECT id FROM users \
+             WHERE (SELECT user_id FROM orders WHERE id = 999) IS NULL \
+             ORDER BY id ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        null_subquery,
+        QueryResult::Rows {
+            columns: vec!["id".to_string()],
+            rows: vec![
+                vec![Value::BigInt(1)],
+                vec![Value::BigInt(2)],
+                vec![Value::BigInt(3)],
+            ],
+        }
+    );
+
+    let multi_row_err = engine
+        .execute_sql(
+            "SELECT id FROM users WHERE id = (SELECT user_id FROM orders WHERE amount >= 20)",
+        )
+        .unwrap_err();
+    assert!(
+        multi_row_err
+            .to_string()
+            .contains("scalar subquery must return at most one row")
     );
 
     cleanup_dir(&dir);

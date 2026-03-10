@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::Hasher;
@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusedb_core::{Column, DataType, Result, RuseDbError, Value};
 use rusedb_exec::{Engine, Executor, QueryResult};
-use rusedb_sql::parse_sql;
+use rusedb_sql::{Expr, JoinClause, Statement, parse_sql};
 use rusedb_storage::Catalog;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,7 @@ struct HttpRequest {
 #[derive(Debug, Clone)]
 struct HttpApiRuntime {
     engine: Arc<Mutex<Engine>>,
+    catalog_base: String,
     bearer_token: Option<String>,
     allow_origin: String,
 }
@@ -71,6 +72,84 @@ struct HttpErrorResponse {
 struct HttpSqlResponse {
     ok: bool,
     results: Vec<HttpQueryResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpAdminLinesResponse {
+    ok: bool,
+    source: String,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpAdminStatsResponse {
+    ok: bool,
+    source: String,
+    stats: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationEntry {
+    version: u64,
+    name: String,
+    up_path: Option<PathBuf>,
+    down_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RbacStore {
+    users: BTreeMap<String, RbacUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RbacUser {
+    username: String,
+    token: String,
+    grants: Vec<RbacGrant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RbacGrant {
+    scope: RbacScope,
+    actions: HashSet<RbacAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RbacScope {
+    Database { database: String },
+    Table { database: String, table: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RbacAction {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Ddl,
+    Admin,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedUser {
+    username: String,
+    grants: Vec<RbacGrant>,
+}
+
+#[derive(Debug, Clone)]
+enum RbacAuthOutcome {
+    Disabled,
+    Authorized(AuthenticatedUser),
+    Unauthorized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionRequirement {
+    action: RbacAction,
+    database: String,
+    table: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +245,30 @@ fn run() -> Result<()> {
         Some("sql") => {
             let rest: Vec<String> = args.collect();
             cmd_sql(&rest)?;
+        }
+        Some("backup") => {
+            let rest: Vec<String> = args.collect();
+            cmd_backup(&rest)?;
+        }
+        Some("restore") => {
+            let rest: Vec<String> = args.collect();
+            cmd_restore(&rest)?;
+        }
+        Some("migrate") => {
+            let rest: Vec<String> = args.collect();
+            cmd_migrate(&rest)?;
+        }
+        Some("user-add") => {
+            let rest: Vec<String> = args.collect();
+            cmd_user_add(&rest)?;
+        }
+        Some("user-list") => {
+            let rest: Vec<String> = args.collect();
+            cmd_user_list(&rest)?;
+        }
+        Some("grant") => {
+            let rest: Vec<String> = args.collect();
+            cmd_grant(&rest)?;
         }
         Some("http") => {
             let rest: Vec<String> = args.collect();
@@ -839,6 +942,308 @@ fn cmd_sql(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_backup(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb backup <catalog_base> <backup_dir>".to_string(),
+        ));
+    }
+    let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
+    let backup_dir = absolute_path(PathBuf::from(&args[1]))?;
+    if backup_dir.exists() && fs::read_dir(&backup_dir)?.next().is_some() {
+        return Err(RuseDbError::Parse(format!(
+            "backup target '{}' must be empty",
+            backup_dir.display()
+        )));
+    }
+    fs::create_dir_all(&backup_dir)?;
+
+    let (_, source_prefix) = family_dir_and_prefix_path(&catalog_base)?;
+    let family_files = list_catalog_family_files(&catalog_base)?;
+    if family_files.is_empty() {
+        return Err(RuseDbError::NotFound {
+            object: "catalog-files".to_string(),
+            name: catalog_base.display().to_string(),
+        });
+    }
+
+    let mut copied = 0usize;
+    for src in family_files {
+        let file_name = src.file_name().ok_or(RuseDbError::Corruption(format!(
+            "invalid source file '{}'",
+            src.display()
+        )))?;
+        fs::copy(&src, backup_dir.join(file_name))?;
+        copied += 1;
+    }
+
+    let created_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let manifest = format!(
+        "version=1\nsource_prefix={source_prefix}\nsource_base={}\ncreated_unix_ms={created_unix_ms}\nfiles={copied}\n",
+        catalog_base.display()
+    );
+    fs::write(backup_manifest_path(&backup_dir), manifest)?;
+
+    println!(
+        "ok: backup created at '{}' (files={copied})",
+        backup_dir.display()
+    );
+    Ok(())
+}
+
+fn cmd_restore(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb restore <backup_dir> <catalog_base>".to_string(),
+        ));
+    }
+    let backup_dir = absolute_path(PathBuf::from(&args[0]))?;
+    let target_base = absolute_path(PathBuf::from(&args[1]))?;
+    let manifest_path = backup_manifest_path(&backup_dir);
+    if !manifest_path.exists() {
+        return Err(RuseDbError::NotFound {
+            object: "backup-manifest".to_string(),
+            name: manifest_path.display().to_string(),
+        });
+    }
+    let manifest_text = fs::read_to_string(&manifest_path)?;
+    let manifest_pairs = parse_kv_config(&manifest_text)?;
+    let source_prefix = required_kv(&manifest_pairs, "source_prefix")?;
+
+    let (target_dir, target_prefix) = family_dir_and_prefix_path(&target_base)?;
+    fs::create_dir_all(&target_dir)?;
+
+    let mut backup_files = Vec::new();
+    for entry in fs::read_dir(&backup_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "backup.manifest" {
+            continue;
+        }
+        if is_catalog_family_file_name(&name, &source_prefix) {
+            backup_files.push(entry.path());
+        }
+    }
+    if backup_files.is_empty() {
+        return Err(RuseDbError::NotFound {
+            object: "backup-family-files".to_string(),
+            name: backup_dir.display().to_string(),
+        });
+    }
+
+    for old in list_catalog_family_files(&target_base)? {
+        fs::remove_file(old)?;
+    }
+
+    let mut restored = 0usize;
+    for src in backup_files {
+        let name = src
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .ok_or(RuseDbError::Corruption(format!(
+                "invalid backup file '{}'",
+                src.display()
+            )))?;
+        let mapped = remap_family_file_prefix(&name, &source_prefix, &target_prefix)?;
+        fs::copy(&src, target_dir.join(mapped))?;
+        restored += 1;
+    }
+    println!(
+        "ok: restore completed from '{}' to '{}' (files={restored})",
+        backup_dir.display(),
+        target_base.display()
+    );
+    Ok(())
+}
+
+fn cmd_migrate(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb migrate <up|down> <catalog_base> <migrations_dir> [steps]".to_string(),
+        ));
+    }
+    match args[0].as_str() {
+        "up" => cmd_migrate_up(&args[1..]),
+        "down" => cmd_migrate_down(&args[1..]),
+        other => Err(RuseDbError::Parse(format!(
+            "unknown migrate action '{other}', expected up or down",
+        ))),
+    }
+}
+
+fn cmd_migrate_up(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb migrate up <catalog_base> <migrations_dir>".to_string(),
+        ));
+    }
+    let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
+    let migrations_dir = absolute_path(PathBuf::from(&args[1]))?;
+    let engine = Engine::new(&catalog_base);
+    let migrations = load_migration_entries(&migrations_dir)?;
+    let mut applied = load_applied_migrations(&catalog_base)?;
+    let mut applied_map = applied
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut executed = 0usize;
+
+    for migration in migrations {
+        let id = migration_id(&migration);
+        if applied_map.contains(&id) {
+            continue;
+        }
+        let up_path = migration.up_path.ok_or(RuseDbError::Parse(format!(
+            "migration '{id}' missing .up.sql file"
+        )))?;
+        let sql = fs::read_to_string(&up_path)?;
+        execute_migration_script(&engine, &id, &sql)?;
+        applied.push(id.clone());
+        applied_map.insert(id.clone());
+        executed += 1;
+    }
+    persist_applied_migrations(&catalog_base, &applied)?;
+    println!("ok: migrate up completed (applied={executed})");
+    Ok(())
+}
+
+fn cmd_migrate_down(args: &[String]) -> Result<()> {
+    if args.len() != 3 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb migrate down <catalog_base> <migrations_dir> <steps>".to_string(),
+        ));
+    }
+    let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
+    let migrations_dir = absolute_path(PathBuf::from(&args[1]))?;
+    let steps = args[2].trim().parse::<usize>().map_err(|_| {
+        RuseDbError::Parse(format!(
+            "invalid steps '{}': expected positive integer",
+            args[2]
+        ))
+    })?;
+    if steps == 0 {
+        return Err(RuseDbError::Parse(
+            "steps must be greater than 0".to_string(),
+        ));
+    }
+    let engine = Engine::new(&catalog_base);
+    let migrations = load_migration_entries(&migrations_dir)?;
+    let migration_map = migrations
+        .into_iter()
+        .map(|migration| (migration_id(&migration), migration))
+        .collect::<HashMap<_, _>>();
+
+    let mut applied = load_applied_migrations(&catalog_base)?;
+    if steps > applied.len() {
+        return Err(RuseDbError::Parse(format!(
+            "cannot migrate down {} step(s): only {} applied migration(s)",
+            steps,
+            applied.len()
+        )));
+    }
+
+    let mut executed = 0usize;
+    for _ in 0..steps {
+        let id = applied.pop().ok_or(RuseDbError::Parse(
+            "no applied migrations to rollback".to_string(),
+        ))?;
+        let migration = migration_map.get(&id).ok_or(RuseDbError::Parse(format!(
+            "applied migration '{id}' not found in migrations directory",
+        )))?;
+        let down_path = migration
+            .down_path
+            .as_ref()
+            .ok_or(RuseDbError::Parse(format!(
+                "migration '{id}' missing .down.sql file"
+            )))?;
+        let sql = fs::read_to_string(down_path)?;
+        execute_migration_script(&engine, &id, &sql)?;
+        executed += 1;
+    }
+    persist_applied_migrations(&catalog_base, &applied)?;
+    println!("ok: migrate down completed (rolled_back={executed})");
+    Ok(())
+}
+
+fn cmd_user_add(args: &[String]) -> Result<()> {
+    if args.len() != 3 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb user-add <catalog_base> <username> <token>".to_string(),
+        ));
+    }
+    let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
+    let username = normalize_user_name(&args[1])?;
+    let token = args[2].trim();
+    if token.is_empty() {
+        return Err(RuseDbError::Parse("token cannot be empty".to_string()));
+    }
+
+    let mut store = load_rbac_store(&catalog_base)?;
+    if store.users.contains_key(&username) {
+        return Err(RuseDbError::AlreadyExists {
+            object: "rbac-user".to_string(),
+            name: username,
+        });
+    }
+    store.users.insert(
+        username.clone(),
+        RbacUser {
+            username: username.clone(),
+            token: token.to_string(),
+            grants: Vec::new(),
+        },
+    );
+    persist_rbac_store(&catalog_base, &store)?;
+    println!("ok: created user '{}'", username);
+    Ok(())
+}
+
+fn cmd_user_list(args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb user-list <catalog_base>".to_string(),
+        ));
+    }
+    let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
+    let store = load_rbac_store(&catalog_base)?;
+    println!("username\tgrants");
+    for user in store.users.values() {
+        println!("{}\t{}", user.username, user.grants.len());
+    }
+    Ok(())
+}
+
+fn cmd_grant(args: &[String]) -> Result<()> {
+    if args.len() != 4 {
+        return Err(RuseDbError::Parse(
+            "usage: rusedb grant <catalog_base> <username> <scope> <actions_csv>".to_string(),
+        ));
+    }
+    let catalog_base = absolute_path(PathBuf::from(&args[0]))?;
+    let username = normalize_user_name(&args[1])?;
+    let scope = parse_rbac_scope_token(&args[2])?;
+    let actions = parse_actions_csv(&args[3])?;
+
+    let mut store = load_rbac_store(&catalog_base)?;
+    let user = store
+        .users
+        .get_mut(&username)
+        .ok_or(RuseDbError::NotFound {
+            object: "rbac-user".to_string(),
+            name: username.clone(),
+        })?;
+    upsert_user_grant(user, scope, actions);
+    persist_rbac_store(&catalog_base, &store)?;
+    println!("ok: grant updated for '{}'", username);
+    Ok(())
+}
+
 fn cmd_http(args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(RuseDbError::Parse(
@@ -902,6 +1307,7 @@ fn cmd_http(args: &[String]) -> Result<()> {
     let listener = TcpListener::bind(&addr)?;
     let runtime = Arc::new(HttpApiRuntime {
         engine: Arc::new(Mutex::new(Engine::new(&base))),
+        catalog_base: base.clone(),
         bearer_token,
         allow_origin,
     });
@@ -920,8 +1326,12 @@ fn cmd_http(args: &[String]) -> Result<()> {
     println!("routes:");
     println!("  GET  /health");
     println!("  POST /sql  {{\"sql\":\"SELECT ...\"}}");
+    println!("  GET  /admin/databases");
+    println!("  GET  /admin/stats?db=default");
+    println!("  GET  /admin/slowlog?db=default&limit=200");
     println!("  GET  /openapi.json");
     println!("  GET  /docs");
+    println!("rbac headers when users exist: X-RuseDB-User, X-RuseDB-Token");
     println!("press Ctrl+C to stop");
 
     loop {
@@ -983,11 +1393,7 @@ fn handle_http_client(mut stream: TcpStream, runtime: &Arc<HttpApiRuntime>) -> R
     let Some(request) = read_http_request(&mut reader)? else {
         return Ok(());
     };
-    let path = request
-        .path
-        .split('?')
-        .next()
-        .unwrap_or(request.path.as_str());
+    let (path, query_params) = split_request_path_and_query(&request.path);
     let cors = cors_headers(&runtime.allow_origin);
     if request.method == "OPTIONS" {
         return write_http_response_with_headers(
@@ -999,7 +1405,7 @@ fn handle_http_client(mut stream: TcpStream, runtime: &Arc<HttpApiRuntime>) -> R
         );
     }
 
-    match path {
+    match path.as_str() {
         "/health" => {
             if request.method != "GET" {
                 return write_http_json_response_with_headers(
@@ -1067,28 +1473,14 @@ fn handle_http_client(mut stream: TcpStream, runtime: &Arc<HttpApiRuntime>) -> R
                     &cors,
                 );
             }
-            if let Some(expected_token) = runtime.bearer_token.as_deref() {
-                let provided = request
-                    .headers
-                    .get("authorization")
-                    .and_then(|value| parse_bearer_token(value));
-                if provided != Some(expected_token) {
-                    let mut headers = cors.clone();
-                    headers.push((
-                        "WWW-Authenticate".to_string(),
-                        "Bearer realm=\"rusedb-http\"".to_string(),
-                    ));
-                    return write_http_json_response_with_headers(
-                        &mut stream,
-                        401,
-                        &HttpErrorResponse {
-                            ok: false,
-                            error: "unauthorized".to_string(),
-                        },
-                        &headers,
-                    );
-                }
+            if !authorize_http_request(&request, runtime, &mut stream, &cors)? {
+                return Ok(());
             }
+            let rbac_auth = match authenticate_rbac_request(&request, runtime, &mut stream, &cors)?
+            {
+                RbacAuthOutcome::Unauthorized => return Ok(()),
+                other => other,
+            };
             let parsed: HttpSqlRequest = match serde_json::from_slice(&request.body) {
                 Ok(value) => value,
                 Err(err) => {
@@ -1140,12 +1532,64 @@ fn handle_http_client(mut stream: TcpStream, runtime: &Arc<HttpApiRuntime>) -> R
                     &cors,
                 );
             }
+            let parsed_statements = match parse_sql_batch(&statements) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
 
             let mut results = Vec::with_capacity(statements.len());
             let guard = runtime
                 .engine
                 .lock()
                 .map_err(|_| RuseDbError::Corruption("engine lock poisoned".to_string()))?;
+            if let RbacAuthOutcome::Authorized(user) = &rbac_auth {
+                let current_db = match current_database_from_engine(&guard) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return write_http_json_response_with_headers(
+                            &mut stream,
+                            500,
+                            &HttpErrorResponse {
+                                ok: false,
+                                error: format!("failed to resolve current database: {err}"),
+                            },
+                            &cors,
+                        );
+                    }
+                };
+                let requirements =
+                    match permission_requirements_for_statements(&parsed_statements, &current_db) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return write_http_json_response_with_headers(
+                                &mut stream,
+                                400,
+                                &HttpErrorResponse {
+                                    ok: false,
+                                    error: format!("unable to evaluate RBAC rules: {err}"),
+                                },
+                                &cors,
+                            );
+                        }
+                    };
+                if let Some(missing) = first_missing_requirement(user, &requirements) {
+                    return write_http_forbidden(
+                        &mut stream,
+                        &cors,
+                        &permission_denied_message(user, &missing),
+                    );
+                }
+            }
             for statement in statements {
                 let result = match guard.execute_sql(&statement) {
                     Ok(value) => value,
@@ -1167,6 +1611,235 @@ fn handle_http_client(mut stream: TcpStream, runtime: &Arc<HttpApiRuntime>) -> R
                 &mut stream,
                 200,
                 &HttpSqlResponse { ok: true, results },
+                &cors,
+            )
+        }
+        "/admin/databases" => {
+            if request.method != "GET" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            if !authorize_http_request(&request, runtime, &mut stream, &cors)? {
+                return Ok(());
+            }
+            let rbac_auth = match authenticate_rbac_request(&request, runtime, &mut stream, &cors)?
+            {
+                RbacAuthOutcome::Unauthorized => return Ok(()),
+                other => other,
+            };
+            if let RbacAuthOutcome::Authorized(user) = &rbac_auth {
+                let requirement = PermissionRequirement {
+                    action: RbacAction::Admin,
+                    database: "*".to_string(),
+                    table: None,
+                };
+                if !user_has_requirement(user, &requirement) {
+                    return write_http_forbidden(
+                        &mut stream,
+                        &cors,
+                        &permission_denied_message(user, &requirement),
+                    );
+                }
+            }
+            let guard = runtime
+                .engine
+                .lock()
+                .map_err(|_| RuseDbError::Corruption("engine lock poisoned".to_string()))?;
+            let result = guard.execute_sql("SHOW DATABASES")?;
+            write_http_json_response_with_headers(
+                &mut stream,
+                200,
+                &HttpSqlResponse {
+                    ok: true,
+                    results: vec![http_query_result(result)],
+                },
+                &cors,
+            )
+        }
+        "/admin/stats" => {
+            if request.method != "GET" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            if !authorize_http_request(&request, runtime, &mut stream, &cors)? {
+                return Ok(());
+            }
+            let rbac_auth = match authenticate_rbac_request(&request, runtime, &mut stream, &cors)?
+            {
+                RbacAuthOutcome::Unauthorized => return Ok(()),
+                other => other,
+            };
+            let db_name = query_params
+                .get("db")
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            let normalized_db = match normalize_database_name(&db_name) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            if let RbacAuthOutcome::Authorized(user) = &rbac_auth {
+                let requirement = PermissionRequirement {
+                    action: RbacAction::Admin,
+                    database: normalized_db,
+                    table: None,
+                };
+                if !user_has_requirement(user, &requirement) {
+                    return write_http_forbidden(
+                        &mut stream,
+                        &cors,
+                        &permission_denied_message(user, &requirement),
+                    );
+                }
+            }
+            let db_base = match database_base_from_catalog(&runtime.catalog_base, &db_name) {
+                Ok(path) => path,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            let source = family_sidecar_path(&db_base, "stats");
+            let stats_text = fs::read_to_string(&source).unwrap_or_default();
+            let stats = parse_stats_text_to_json(&stats_text);
+            write_http_json_response_with_headers(
+                &mut stream,
+                200,
+                &HttpAdminStatsResponse {
+                    ok: true,
+                    source: source.display().to_string(),
+                    stats,
+                },
+                &cors,
+            )
+        }
+        "/admin/slowlog" => {
+            if request.method != "GET" {
+                return write_http_json_response_with_headers(
+                    &mut stream,
+                    405,
+                    &HttpErrorResponse {
+                        ok: false,
+                        error: "method not allowed".to_string(),
+                    },
+                    &cors,
+                );
+            }
+            if !authorize_http_request(&request, runtime, &mut stream, &cors)? {
+                return Ok(());
+            }
+            let rbac_auth = match authenticate_rbac_request(&request, runtime, &mut stream, &cors)?
+            {
+                RbacAuthOutcome::Unauthorized => return Ok(()),
+                other => other,
+            };
+            let db_name = query_params
+                .get("db")
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            let normalized_db = match normalize_database_name(&db_name) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            if let RbacAuthOutcome::Authorized(user) = &rbac_auth {
+                let requirement = PermissionRequirement {
+                    action: RbacAction::Admin,
+                    database: normalized_db,
+                    table: None,
+                };
+                if !user_has_requirement(user, &requirement) {
+                    return write_http_forbidden(
+                        &mut stream,
+                        &cors,
+                        &permission_denied_message(user, &requirement),
+                    );
+                }
+            }
+            let db_base = match database_base_from_catalog(&runtime.catalog_base, &db_name) {
+                Ok(path) => path,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            let limit = match parse_query_limit(query_params.get("limit"), 200, 5000) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_http_json_response_with_headers(
+                        &mut stream,
+                        400,
+                        &HttpErrorResponse {
+                            ok: false,
+                            error: err.to_string(),
+                        },
+                        &cors,
+                    );
+                }
+            };
+            let source = family_sidecar_path(&db_base, "slowlog");
+            let text = fs::read_to_string(&source).unwrap_or_default();
+            let mut lines = text
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            if lines.len() > limit {
+                lines = lines[lines.len() - limit..].to_vec();
+            }
+            write_http_json_response_with_headers(
+                &mut stream,
+                200,
+                &HttpAdminLinesResponse {
+                    ok: true,
+                    source: source.display().to_string(),
+                    lines,
+                },
                 &cors,
             )
         }
@@ -1278,6 +1951,7 @@ fn http_status_text(status: u16) -> &'static str {
     match status {
         204 => "No Content",
         200 => "OK",
+        403 => "Forbidden",
         401 => "Unauthorized",
         400 => "Bad Request",
         404 => "Not Found",
@@ -1299,7 +1973,7 @@ fn cors_headers(allow_origin: &str) -> Vec<(String, String)> {
         ),
         (
             "Access-Control-Allow-Headers".to_string(),
-            "Authorization, Content-Type".to_string(),
+            "Authorization, Content-Type, X-RuseDB-User, X-RuseDB-Token".to_string(),
         ),
         ("Access-Control-Max-Age".to_string(), "86400".to_string()),
     ]
@@ -1312,6 +1986,995 @@ fn parse_bearer_token(header_value: &str) -> Option<&str> {
     }
     let token = token.trim();
     if token.is_empty() { None } else { Some(token) }
+}
+
+fn authorize_http_request(
+    request: &HttpRequest,
+    runtime: &Arc<HttpApiRuntime>,
+    stream: &mut TcpStream,
+    cors: &[(String, String)],
+) -> Result<bool> {
+    let Some(expected_token) = runtime.bearer_token.as_deref() else {
+        return Ok(true);
+    };
+    let provided = request
+        .headers
+        .get("authorization")
+        .and_then(|value| parse_bearer_token(value));
+    if provided == Some(expected_token) {
+        return Ok(true);
+    }
+
+    let mut headers = cors.to_vec();
+    headers.push((
+        "WWW-Authenticate".to_string(),
+        "Bearer realm=\"rusedb-http\"".to_string(),
+    ));
+    write_http_json_response_with_headers(
+        stream,
+        401,
+        &HttpErrorResponse {
+            ok: false,
+            error: "unauthorized".to_string(),
+        },
+        &headers,
+    )?;
+    Ok(false)
+}
+
+fn write_http_forbidden(
+    stream: &mut TcpStream,
+    cors: &[(String, String)],
+    message: &str,
+) -> Result<()> {
+    write_http_json_response_with_headers(
+        stream,
+        403,
+        &HttpErrorResponse {
+            ok: false,
+            error: message.to_string(),
+        },
+        cors,
+    )
+}
+
+fn write_http_unauthorized(
+    stream: &mut TcpStream,
+    cors: &[(String, String)],
+    message: &str,
+) -> Result<()> {
+    write_http_json_response_with_headers(
+        stream,
+        401,
+        &HttpErrorResponse {
+            ok: false,
+            error: message.to_string(),
+        },
+        cors,
+    )
+}
+
+fn authenticate_rbac_request(
+    request: &HttpRequest,
+    runtime: &Arc<HttpApiRuntime>,
+    stream: &mut TcpStream,
+    cors: &[(String, String)],
+) -> Result<RbacAuthOutcome> {
+    let store = load_rbac_store(Path::new(&runtime.catalog_base))?;
+    if store.users.is_empty() {
+        return Ok(RbacAuthOutcome::Disabled);
+    }
+
+    let raw_user = request.headers.get("x-rusedb-user").map(String::as_str);
+    let raw_token = request.headers.get("x-rusedb-token").map(String::as_str);
+    let Some(raw_user) = raw_user else {
+        write_http_unauthorized(stream, cors, "missing X-RuseDB-User header")?;
+        return Ok(RbacAuthOutcome::Unauthorized);
+    };
+    let Some(raw_token) = raw_token else {
+        write_http_unauthorized(stream, cors, "missing X-RuseDB-Token header")?;
+        return Ok(RbacAuthOutcome::Unauthorized);
+    };
+    let username = match normalize_user_name(raw_user) {
+        Ok(value) => value,
+        Err(_) => {
+            write_http_unauthorized(stream, cors, "invalid RBAC user identity")?;
+            return Ok(RbacAuthOutcome::Unauthorized);
+        }
+    };
+    let token = raw_token.trim();
+    if token.is_empty() {
+        write_http_unauthorized(stream, cors, "invalid RBAC token")?;
+        return Ok(RbacAuthOutcome::Unauthorized);
+    }
+
+    let Some(user) = store.users.get(&username) else {
+        write_http_unauthorized(stream, cors, "invalid RBAC credentials")?;
+        return Ok(RbacAuthOutcome::Unauthorized);
+    };
+    if user.token != token {
+        write_http_unauthorized(stream, cors, "invalid RBAC credentials")?;
+        return Ok(RbacAuthOutcome::Unauthorized);
+    }
+
+    Ok(RbacAuthOutcome::Authorized(AuthenticatedUser {
+        username: user.username.clone(),
+        grants: user.grants.clone(),
+    }))
+}
+
+fn parse_sql_batch(statements: &[String]) -> Result<Vec<Statement>> {
+    statements
+        .iter()
+        .map(|statement| parse_sql(statement))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn current_database_from_engine(engine: &Engine) -> Result<String> {
+    let result = engine.execute_sql("SHOW CURRENT DATABASE")?;
+    let QueryResult::Rows { rows, .. } = result else {
+        return Err(RuseDbError::Corruption(
+            "SHOW CURRENT DATABASE returned unexpected result".to_string(),
+        ));
+    };
+    let name = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|value| match value {
+            Value::Varchar(name) => Some(name.clone()),
+            _ => None,
+        })
+        .ok_or(RuseDbError::Corruption(
+            "SHOW CURRENT DATABASE returned malformed row".to_string(),
+        ))?;
+    normalize_database_name(&name)
+}
+
+fn split_request_path_and_query(raw_path: &str) -> (String, HashMap<String, String>) {
+    let mut query = HashMap::new();
+    let Some((path, raw_query)) = raw_path.split_once('?') else {
+        return (raw_path.to_string(), query);
+    };
+    for pair in raw_query.split('&') {
+        let trimmed = pair.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = trimmed.split_once('=').unwrap_or((trimmed, ""));
+        if key.trim().is_empty() {
+            continue;
+        }
+        query.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    (path.to_string(), query)
+}
+
+fn parse_query_limit(raw: Option<&String>, default: usize, max: usize) -> Result<usize> {
+    let Some(raw_value) = raw else {
+        return Ok(default);
+    };
+    let value = raw_value.trim().parse::<usize>().map_err(|_| {
+        RuseDbError::Parse(format!(
+            "invalid limit '{}': expected integer 1..{}",
+            raw_value, max
+        ))
+    })?;
+    if value == 0 {
+        return Err(RuseDbError::Parse(
+            "limit must be greater than 0".to_string(),
+        ));
+    }
+    Ok(value.min(max))
+}
+
+fn family_sidecar_path(base: &Path, suffix: &str) -> PathBuf {
+    let mut out = base.as_os_str().to_os_string();
+    out.push(format!(".{suffix}"));
+    PathBuf::from(out)
+}
+
+fn parse_stats_text_to_json(content: &str) -> serde_json::Value {
+    if content.trim().is_empty() {
+        return serde_json::json!({
+            "version": null,
+            "tables": []
+        });
+    }
+
+    let mut version: Option<u32> = None;
+    let mut tables = Vec::new();
+    let mut current_table: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut raw_lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        raw_lines.push(trimmed.to_string());
+        if version.is_none() && trimmed.starts_with("RUSEDB_STATS ") {
+            version = trimmed
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u32>().ok());
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let Some(tag) = parts.next() else {
+            continue;
+        };
+        match tag {
+            "TABLE" => {
+                if let Some(prev) = current_table.take() {
+                    tables.push(prev);
+                }
+                let table = parts.next().unwrap_or_default().to_string();
+                let row_count = parts
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let updated_unix_ms = parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let mut map = serde_json::Map::new();
+                map.insert("table".to_string(), serde_json::Value::String(table));
+                map.insert("row_count".to_string(), serde_json::Value::from(row_count));
+                map.insert(
+                    "updated_unix_ms".to_string(),
+                    serde_json::Value::from(updated_unix_ms),
+                );
+                map.insert("columns".to_string(), serde_json::json!([]));
+                current_table = Some(map);
+            }
+            "COLUMN" => {
+                if let Some(table) = current_table.as_mut() {
+                    let name = parts.next().unwrap_or_default();
+                    let distinct = parts
+                        .next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let null_count = parts
+                        .next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if let Some(columns) = table.get_mut("columns").and_then(|v| v.as_array_mut()) {
+                        columns.push(serde_json::json!({
+                            "name": name,
+                            "distinct_count": distinct,
+                            "null_count": null_count
+                        }));
+                    }
+                }
+            }
+            "END" => {
+                if let Some(prev) = current_table.take() {
+                    tables.push(prev);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(prev) = current_table.take() {
+        tables.push(prev);
+    }
+
+    serde_json::json!({
+        "version": version,
+        "tables": tables,
+        "raw_lines": raw_lines
+    })
+}
+
+fn normalize_identifier_name(name: &str, label: &str) -> Result<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(RuseDbError::Parse(format!("{label} cannot be empty")));
+    }
+    let mut chars = normalized.chars();
+    let Some(first) = chars.next() else {
+        return Err(RuseDbError::Parse(format!("{label} cannot be empty")));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(RuseDbError::Parse(format!(
+            "invalid {label} '{}': must start with a letter or underscore",
+            name
+        )));
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return Err(RuseDbError::Parse(format!(
+            "invalid {label} '{}': only letters, digits and underscore are allowed",
+            name
+        )));
+    }
+    Ok(normalized)
+}
+
+fn normalize_identifier_or_wildcard(name: &str, label: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed == "*" {
+        return Ok("*".to_string());
+    }
+    normalize_identifier_name(trimmed, label)
+}
+
+fn normalize_database_name(name: &str) -> Result<String> {
+    normalize_identifier_name(name, "database name")
+}
+
+fn normalize_table_name(name: &str) -> Result<String> {
+    normalize_identifier_name(name, "table name")
+}
+
+fn normalize_user_name(name: &str) -> Result<String> {
+    normalize_identifier_name(name, "username")
+}
+
+fn normalize_scope_database_name(name: &str) -> Result<String> {
+    normalize_identifier_or_wildcard(name, "database scope")
+}
+
+fn normalize_scope_table_name(name: &str) -> Result<String> {
+    normalize_identifier_or_wildcard(name, "table scope")
+}
+
+fn rbac_store_path(catalog_base: &Path) -> PathBuf {
+    family_sidecar_path(catalog_base, "rbac")
+}
+
+fn load_rbac_store(catalog_base: &Path) -> Result<RbacStore> {
+    let path = rbac_store_path(catalog_base);
+    if !path.exists() {
+        return Ok(RbacStore::default());
+    }
+    let raw = fs::read_to_string(&path)?;
+    if raw.trim().is_empty() {
+        return Ok(RbacStore::default());
+    }
+    let mut store: RbacStore = serde_json::from_str(&raw).map_err(|err| {
+        RuseDbError::Parse(format!("invalid RBAC store '{}': {err}", path.display()))
+    })?;
+
+    let mut normalized = BTreeMap::new();
+    for (_, mut user) in store.users {
+        let username = normalize_user_name(&user.username)?;
+        user.username = username.clone();
+        for grant in &mut user.grants {
+            match &mut grant.scope {
+                RbacScope::Database { database } => {
+                    *database = normalize_scope_database_name(database)?;
+                }
+                RbacScope::Table { database, table } => {
+                    *database = normalize_scope_database_name(database)?;
+                    *table = normalize_scope_table_name(table)?;
+                }
+            }
+        }
+        normalized.insert(username, user);
+    }
+    store.users = normalized;
+    Ok(store)
+}
+
+fn persist_rbac_store(catalog_base: &Path, store: &RbacStore) -> Result<()> {
+    let path = rbac_store_path(catalog_base);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(store)
+        .map_err(|err| RuseDbError::Parse(format!("failed to encode RBAC store: {err}")))?;
+    fs::write(path, payload)?;
+    Ok(())
+}
+
+fn parse_rbac_scope_token(raw: &str) -> Result<RbacScope> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(RuseDbError::Parse("scope cannot be empty".to_string()));
+    }
+    let (kind, value) = if let Some((prefix, rest)) = token.split_once(':') {
+        (Some(prefix.trim().to_ascii_lowercase()), rest.trim())
+    } else {
+        (None, token)
+    };
+    if value.is_empty() {
+        return Err(RuseDbError::Parse("scope cannot be empty".to_string()));
+    }
+
+    let parse_db_scope = || -> Result<RbacScope> {
+        Ok(RbacScope::Database {
+            database: normalize_scope_database_name(value)?,
+        })
+    };
+    let parse_table_scope = || -> Result<RbacScope> {
+        let (database, table) = value.split_once('.').ok_or(RuseDbError::Parse(format!(
+            "invalid table scope '{}': expected <database>.<table>",
+            raw
+        )))?;
+        Ok(RbacScope::Table {
+            database: normalize_scope_database_name(database)?,
+            table: normalize_scope_table_name(table)?,
+        })
+    };
+
+    match kind.as_deref() {
+        Some("db") | Some("database") => parse_db_scope(),
+        Some("table") => parse_table_scope(),
+        Some(other) => Err(RuseDbError::Parse(format!(
+            "invalid scope prefix '{}': expected db/database/table",
+            other
+        ))),
+        None => {
+            if value.contains('.') {
+                parse_table_scope()
+            } else {
+                parse_db_scope()
+            }
+        }
+    }
+}
+
+fn parse_action_token(raw: &str) -> Result<Vec<RbacAction>> {
+    let action = raw.trim().to_ascii_lowercase();
+    if action.is_empty() {
+        return Err(RuseDbError::Parse("action cannot be empty".to_string()));
+    }
+    let expanded = match action.as_str() {
+        "select" | "read" => vec![RbacAction::Select],
+        "insert" => vec![RbacAction::Insert],
+        "update" => vec![RbacAction::Update],
+        "delete" => vec![RbacAction::Delete],
+        "write" => vec![RbacAction::Insert, RbacAction::Update, RbacAction::Delete],
+        "ddl" => vec![RbacAction::Ddl],
+        "admin" => vec![RbacAction::Admin],
+        "all" => vec![
+            RbacAction::Select,
+            RbacAction::Insert,
+            RbacAction::Update,
+            RbacAction::Delete,
+            RbacAction::Ddl,
+            RbacAction::Admin,
+        ],
+        _ => {
+            return Err(RuseDbError::Parse(format!(
+                "unknown RBAC action '{}': expected select,insert,update,delete,ddl,admin,write,all",
+                raw
+            )));
+        }
+    };
+    Ok(expanded)
+}
+
+fn parse_actions_csv(raw: &str) -> Result<HashSet<RbacAction>> {
+    let mut actions = HashSet::new();
+    for token in raw.split(',') {
+        for action in parse_action_token(token)? {
+            actions.insert(action);
+        }
+    }
+    if actions.is_empty() {
+        return Err(RuseDbError::Parse(
+            "actions cannot be empty; expected CSV like select,insert".to_string(),
+        ));
+    }
+    Ok(actions)
+}
+
+fn upsert_user_grant(user: &mut RbacUser, scope: RbacScope, actions: HashSet<RbacAction>) {
+    if let Some(existing) = user.grants.iter_mut().find(|grant| grant.scope == scope) {
+        existing.actions.extend(actions);
+        return;
+    }
+    user.grants.push(RbacGrant { scope, actions });
+}
+
+fn permission_target(requirement: &PermissionRequirement) -> String {
+    match &requirement.table {
+        Some(table) => format!("{}.{}", requirement.database, table),
+        None => requirement.database.clone(),
+    }
+}
+
+fn permission_denied_message(
+    user: &AuthenticatedUser,
+    requirement: &PermissionRequirement,
+) -> String {
+    format!(
+        "RBAC denied: user '{}' requires '{}' on '{}'",
+        user.username,
+        rbac_action_name(requirement.action),
+        permission_target(requirement)
+    )
+}
+
+fn rbac_action_name(action: RbacAction) -> &'static str {
+    match action {
+        RbacAction::Select => "select",
+        RbacAction::Insert => "insert",
+        RbacAction::Update => "update",
+        RbacAction::Delete => "delete",
+        RbacAction::Ddl => "ddl",
+        RbacAction::Admin => "admin",
+    }
+}
+
+fn names_match(scope_name: &str, concrete_name: &str) -> bool {
+    scope_name == "*" || scope_name == concrete_name
+}
+
+fn scope_matches_requirement(scope: &RbacScope, requirement: &PermissionRequirement) -> bool {
+    match scope {
+        RbacScope::Database { database } => names_match(database, &requirement.database),
+        RbacScope::Table { database, table } => {
+            let Some(requirement_table) = requirement.table.as_deref() else {
+                return false;
+            };
+            names_match(database, &requirement.database) && names_match(table, requirement_table)
+        }
+    }
+}
+
+fn grant_satisfies_requirement(grant: &RbacGrant, requirement: &PermissionRequirement) -> bool {
+    if !scope_matches_requirement(&grant.scope, requirement) {
+        return false;
+    }
+    grant.actions.contains(&RbacAction::Admin) || grant.actions.contains(&requirement.action)
+}
+
+fn user_has_requirement(user: &AuthenticatedUser, requirement: &PermissionRequirement) -> bool {
+    user.grants
+        .iter()
+        .any(|grant| grant_satisfies_requirement(grant, requirement))
+}
+
+fn first_missing_requirement(
+    user: &AuthenticatedUser,
+    requirements: &[PermissionRequirement],
+) -> Option<PermissionRequirement> {
+    requirements
+        .iter()
+        .find(|requirement| !user_has_requirement(user, requirement))
+        .cloned()
+}
+
+fn push_permission_requirement(
+    out: &mut Vec<PermissionRequirement>,
+    action: RbacAction,
+    database: String,
+    table: Option<String>,
+) {
+    let requirement = PermissionRequirement {
+        action,
+        database,
+        table,
+    };
+    if !out.contains(&requirement) {
+        out.push(requirement);
+    }
+}
+
+fn collect_expression_permissions(
+    expr: &Expr,
+    current_db: &str,
+    out: &mut Vec<PermissionRequirement>,
+) -> Result<()> {
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            collect_expression_permissions(left, current_db, out)?;
+            collect_expression_permissions(right, current_db, out)?;
+        }
+        Expr::Unary { expr, .. } => {
+            collect_expression_permissions(expr, current_db, out)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expression_permissions(expr, current_db, out)?;
+            for item in list {
+                collect_expression_permissions(item, current_db, out)?;
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_expression_permissions(expr, current_db, out)?;
+            collect_statement_permissions(subquery, current_db, out)?;
+        }
+        Expr::ScalarSubquery { subquery } => {
+            collect_statement_permissions(subquery, current_db, out)?;
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_expression_permissions(expr, current_db, out)?;
+            collect_expression_permissions(pattern, current_db, out)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expression_permissions(expr, current_db, out)?;
+            collect_expression_permissions(low, current_db, out)?;
+            collect_expression_permissions(high, current_db, out)?;
+        }
+        Expr::IsNull { expr, .. } => {
+            collect_expression_permissions(expr, current_db, out)?;
+        }
+        Expr::Identifier(_) | Expr::Literal(_) | Expr::Aggregate { .. } => {}
+    }
+    Ok(())
+}
+
+fn collect_join_permissions(
+    joins: &[JoinClause],
+    current_db: &str,
+    out: &mut Vec<PermissionRequirement>,
+) -> Result<()> {
+    for join in joins {
+        let join_table = normalize_table_name(&join.table)?;
+        push_permission_requirement(
+            out,
+            RbacAction::Select,
+            current_db.to_string(),
+            Some(join_table),
+        );
+        collect_expression_permissions(&join.on, current_db, out)?;
+    }
+    Ok(())
+}
+
+fn collect_statement_permissions(
+    statement: &Statement,
+    current_db: &str,
+    out: &mut Vec<PermissionRequirement>,
+) -> Result<()> {
+    match statement {
+        Statement::Explain { statement, .. } => {
+            collect_statement_permissions(statement, current_db, out)?;
+        }
+        Statement::AnalyzeTable { table } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Admin,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+        }
+        Statement::Begin | Statement::Commit | Statement::Rollback => {}
+        Statement::CreateDatabase { name } | Statement::DropDatabase { name } => {
+            push_permission_requirement(out, RbacAction::Ddl, normalize_database_name(name)?, None);
+        }
+        Statement::UseDatabase { name } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Select,
+                normalize_database_name(name)?,
+                None,
+            );
+        }
+        Statement::ShowDatabases => {
+            push_permission_requirement(out, RbacAction::Admin, "*".to_string(), None);
+        }
+        Statement::ShowCurrentDatabase | Statement::ShowTables => {
+            push_permission_requirement(out, RbacAction::Select, current_db.to_string(), None);
+        }
+        Statement::DropTable { name } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Ddl,
+                current_db.to_string(),
+                Some(normalize_table_name(name)?),
+            );
+        }
+        Statement::AlterTableAddColumn { table, .. }
+        | Statement::AlterTableDropColumn { table, .. }
+        | Statement::AlterTableAlterColumn { table, .. }
+        | Statement::CreateTable { name: table, .. }
+        | Statement::CreateIndex { table, .. } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Ddl,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+        }
+        Statement::RenameTable { old_name, new_name } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Ddl,
+                current_db.to_string(),
+                Some(normalize_table_name(old_name)?),
+            );
+            push_permission_requirement(
+                out,
+                RbacAction::Ddl,
+                current_db.to_string(),
+                Some(normalize_table_name(new_name)?),
+            );
+        }
+        Statement::RenameColumn { table, .. } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Ddl,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+        }
+        Statement::Insert { table, rows, .. } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Insert,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+            for row in rows {
+                for expr in row {
+                    collect_expression_permissions(expr, current_db, out)?;
+                }
+            }
+        }
+        Statement::Select {
+            table,
+            joins,
+            selection,
+            having,
+            ..
+        } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Select,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+            collect_join_permissions(joins, current_db, out)?;
+            if let Some(selection_expr) = selection {
+                collect_expression_permissions(selection_expr, current_db, out)?;
+            }
+            if let Some(having_expr) = having {
+                collect_expression_permissions(having_expr, current_db, out)?;
+            }
+        }
+        Statement::Delete { table, selection } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Delete,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+            if let Some(selection_expr) = selection {
+                collect_expression_permissions(selection_expr, current_db, out)?;
+            }
+        }
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+        } => {
+            push_permission_requirement(
+                out,
+                RbacAction::Update,
+                current_db.to_string(),
+                Some(normalize_table_name(table)?),
+            );
+            for assignment in assignments {
+                collect_expression_permissions(&assignment.value, current_db, out)?;
+            }
+            if let Some(selection_expr) = selection {
+                collect_expression_permissions(selection_expr, current_db, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn permission_requirements_for_statements(
+    statements: &[Statement],
+    initial_database: &str,
+) -> Result<Vec<PermissionRequirement>> {
+    let mut requirements = Vec::new();
+    let mut current_db = normalize_database_name(initial_database)?;
+    for statement in statements {
+        collect_statement_permissions(statement, &current_db, &mut requirements)?;
+        if let Statement::UseDatabase { name } = statement {
+            current_db = normalize_database_name(name)?;
+        }
+    }
+    Ok(requirements)
+}
+
+fn family_dir_and_prefix_path(base: &Path) -> Result<(PathBuf, String)> {
+    let dir = base
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let prefix = base
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or(RuseDbError::Parse(format!(
+            "invalid catalog base path '{}'",
+            base.display()
+        )))?;
+    Ok((dir, prefix))
+}
+
+fn is_catalog_family_file_name(file_name: &str, prefix: &str) -> bool {
+    file_name.starts_with(&format!("{prefix}.")) || file_name.starts_with(&format!("{prefix}-db-"))
+}
+
+fn list_catalog_family_files(catalog_base: &Path) -> Result<Vec<PathBuf>> {
+    let (dir, prefix) = family_dir_and_prefix_path(catalog_base)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_catalog_family_file_name(&name, &prefix) {
+            out.push(entry.path());
+        }
+    }
+    Ok(out)
+}
+
+fn remap_family_file_prefix(file_name: &str, from_prefix: &str, to_prefix: &str) -> Result<String> {
+    let suffix = file_name
+        .strip_prefix(from_prefix)
+        .ok_or(RuseDbError::Corruption(format!(
+            "backup file '{}' does not start with '{}'",
+            file_name, from_prefix
+        )))?;
+    Ok(format!("{to_prefix}{suffix}"))
+}
+
+fn backup_manifest_path(backup_dir: &Path) -> PathBuf {
+    backup_dir.join("backup.manifest")
+}
+
+fn database_base_from_catalog(catalog_base: &str, db_name: &str) -> Result<PathBuf> {
+    let catalog_base = PathBuf::from(catalog_base);
+    let normalized = normalize_database_name(db_name)?;
+    if normalized == "default" {
+        return Ok(catalog_base);
+    }
+    let (dir, prefix) = family_dir_and_prefix_path(&catalog_base)?;
+    Ok(dir.join(format!("{prefix}-db-{normalized}")))
+}
+
+fn migration_state_path(catalog_base: &Path) -> PathBuf {
+    family_sidecar_path(catalog_base, "migrations")
+}
+
+fn parse_migration_file_name(file_name: &str) -> Result<Option<(u64, String, bool)>> {
+    if !file_name.ends_with(".sql") {
+        return Ok(None);
+    }
+    let (stem, is_up) = if let Some(value) = file_name.strip_suffix(".up.sql") {
+        (value, true)
+    } else if let Some(value) = file_name.strip_suffix(".down.sql") {
+        (value, false)
+    } else {
+        return Err(RuseDbError::Parse(format!(
+            "invalid migration file '{}': expected .up.sql or .down.sql suffix",
+            file_name
+        )));
+    };
+
+    let (version_raw, name) = stem.split_once('_').ok_or(RuseDbError::Parse(format!(
+        "invalid migration file '{}': expected <version>_<name>.up.sql",
+        file_name
+    )))?;
+    if name.trim().is_empty() {
+        return Err(RuseDbError::Parse(format!(
+            "invalid migration file '{}': name cannot be empty",
+            file_name
+        )));
+    }
+    let version = version_raw.parse::<u64>().map_err(|_| {
+        RuseDbError::Parse(format!(
+            "invalid migration file '{}': version must be integer",
+            file_name
+        ))
+    })?;
+    Ok(Some((version, name.to_string(), is_up)))
+}
+
+fn load_migration_entries(migrations_dir: &Path) -> Result<Vec<MigrationEntry>> {
+    if !migrations_dir.exists() {
+        return Err(RuseDbError::NotFound {
+            object: "migrations-dir".to_string(),
+            name: migrations_dir.display().to_string(),
+        });
+    }
+    let mut entries = BTreeMap::<(u64, String), MigrationEntry>::new();
+    for item in fs::read_dir(migrations_dir)? {
+        let item = item?;
+        if !item.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = item.file_name().to_string_lossy().to_string();
+        let Some((version, name, is_up)) = parse_migration_file_name(&file_name)? else {
+            continue;
+        };
+        let key = (version, name.clone());
+        let entry = entries.entry(key).or_insert(MigrationEntry {
+            version,
+            name,
+            up_path: None,
+            down_path: None,
+        });
+        if is_up {
+            entry.up_path = Some(item.path());
+        } else {
+            entry.down_path = Some(item.path());
+        }
+    }
+    Ok(entries.into_values().collect())
+}
+
+fn migration_id(entry: &MigrationEntry) -> String {
+    format!("{}_{}", entry.version, entry.name)
+}
+
+fn load_applied_migrations(catalog_base: &Path) -> Result<Vec<String>> {
+    let path = migration_state_path(catalog_base);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn persist_applied_migrations(catalog_base: &Path, applied: &[String]) -> Result<()> {
+    let mut content = String::new();
+    for item in applied {
+        content.push_str(item);
+        content.push('\n');
+    }
+    fs::write(migration_state_path(catalog_base), content)?;
+    Ok(())
+}
+
+fn is_tx_control_statement(statement: &str) -> bool {
+    let upper = statement.trim().to_ascii_uppercase();
+    upper.starts_with("BEGIN") || upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK")
+}
+
+fn execute_migration_script(engine: &Engine, migration_id: &str, sql: &str) -> Result<()> {
+    let statements = split_sql_statements(sql)?;
+    if statements.is_empty() {
+        return Err(RuseDbError::Parse(format!(
+            "migration '{}' has no SQL statements",
+            migration_id
+        )));
+    }
+    let has_tx_control = statements.iter().any(|stmt| is_tx_control_statement(stmt));
+    if has_tx_control {
+        for statement in statements {
+            engine.execute_sql(&statement)?;
+        }
+        return Ok(());
+    }
+
+    engine.execute_sql("BEGIN")?;
+    for statement in statements {
+        if let Err(err) = engine.execute_sql(&statement) {
+            let _ = engine.execute_sql("ROLLBACK");
+            return Err(RuseDbError::Parse(format!(
+                "migration '{}' failed: {}",
+                migration_id, err
+            )));
+        }
+    }
+    if let Err(err) = engine.execute_sql("COMMIT") {
+        let _ = engine.execute_sql("ROLLBACK");
+        return Err(RuseDbError::Parse(format!(
+            "migration '{}' commit failed: {}",
+            migration_id, err
+        )));
+    }
+    Ok(())
 }
 
 fn openapi_spec_json() -> serde_json::Value {
@@ -1334,6 +2997,7 @@ fn openapi_spec_json() -> serde_json::Value {
         "/sql": {
           "post": {
             "summary": "Execute SQL batch",
+            "description": "If RBAC users are configured, include X-RuseDB-User and X-RuseDB-Token headers.",
             "security": [{"bearerAuth": []}],
             "requestBody": {
               "required": true,
@@ -1352,6 +3016,46 @@ fn openapi_spec_json() -> serde_json::Value {
             "responses": {
               "200": {"description": "SQL executed successfully"},
               "400": {"description": "Bad SQL or payload"},
+              "401": {"description": "Unauthorized"}
+            }
+          }
+        },
+        "/admin/databases": {
+          "get": {
+            "summary": "List databases (management endpoint)",
+            "description": "Requires admin permission when RBAC users are configured.",
+            "security": [{"bearerAuth": []}],
+            "responses": {
+              "200": {"description": "Database list"},
+              "401": {"description": "Unauthorized"}
+            }
+          }
+        },
+        "/admin/stats": {
+          "get": {
+            "summary": "Read stats sidecar (management endpoint)",
+            "description": "Requires admin permission on target database when RBAC users are configured.",
+            "security": [{"bearerAuth": []}],
+            "parameters": [
+              {"name": "db", "in": "query", "required": false, "schema": {"type": "string", "default": "default"}}
+            ],
+            "responses": {
+              "200": {"description": "Stats payload"},
+              "401": {"description": "Unauthorized"}
+            }
+          }
+        },
+        "/admin/slowlog": {
+          "get": {
+            "summary": "Read slow query log (management endpoint)",
+            "description": "Requires admin permission on target database when RBAC users are configured.",
+            "security": [{"bearerAuth": []}],
+            "parameters": [
+              {"name": "db", "in": "query", "required": false, "schema": {"type": "string", "default": "default"}},
+              {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 200}}
+            ],
+            "responses": {
+              "200": {"description": "Slow log lines"},
               "401": {"description": "Unauthorized"}
             }
           }
@@ -1463,9 +3167,18 @@ fn print_usage() {
     println!("  rusedb describe <catalog_base> <table_name>");
     println!("  rusedb parse-sql <sql>");
     println!("  rusedb sql <catalog_base> <sql-or-batch>");
+    println!("  rusedb backup <catalog_base> <backup_dir>");
+    println!("  rusedb restore <backup_dir> <catalog_base>");
+    println!("  rusedb migrate up <catalog_base> <migrations_dir>");
+    println!("  rusedb migrate down <catalog_base> <migrations_dir> <steps>");
+    println!("  rusedb user-add <catalog_base> <username> <token>");
+    println!("  rusedb user-list <catalog_base>");
+    println!("  rusedb grant <catalog_base> <username> <scope> <actions_csv>");
     println!(
         "  rusedb http <catalog_base> [host:port] [--token <token>] [--allow-origin <origin>]"
     );
+    println!("    scope examples: db:app | table:app.users | table:app.* | db:*");
+    println!("    actions: select,insert,update,delete,ddl,admin,write,all");
 }
 
 fn print_query_result(result: QueryResult) {
@@ -1538,4 +3251,150 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
         out.push(tail.to_string());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{
+        AuthenticatedUser, PermissionRequirement, RbacAction, RbacGrant, RbacScope, RbacUser,
+        first_missing_requirement, parse_actions_csv, parse_migration_file_name,
+        parse_rbac_scope_token, parse_sql, permission_requirements_for_statements,
+        remap_family_file_prefix, split_request_path_and_query, split_sql_statements,
+        upsert_user_grant,
+    };
+
+    #[test]
+    fn parse_migration_filename_works() {
+        let parsed = parse_migration_file_name("001_init.up.sql")
+            .unwrap()
+            .expect("expected migration file");
+        assert_eq!(parsed.0, 1);
+        assert_eq!(parsed.1, "init");
+        assert!(parsed.2);
+
+        let parsed_down = parse_migration_file_name("001_init.down.sql")
+            .unwrap()
+            .expect("expected migration file");
+        assert_eq!(parsed_down.0, 1);
+        assert_eq!(parsed_down.1, "init");
+        assert!(!parsed_down.2);
+    }
+
+    #[test]
+    fn split_request_path_and_query_works() {
+        let (path, query) = split_request_path_and_query("/admin/slowlog?db=app&limit=50");
+        assert_eq!(path, "/admin/slowlog");
+        assert_eq!(query.get("db").map(String::as_str), Some("app"));
+        assert_eq!(query.get("limit").map(String::as_str), Some("50"));
+    }
+
+    #[test]
+    fn remap_family_file_prefix_works() {
+        let mapped = remap_family_file_prefix("rusedb-db-app.tables", "rusedb", "prod").unwrap();
+        assert_eq!(mapped, "prod-db-app.tables");
+    }
+
+    #[test]
+    fn split_sql_batch_handles_strings() {
+        let sql = "INSERT INTO t (name) VALUES ('a;bc'); SELECT * FROM t;";
+        let stmts = split_sql_statements(sql).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("'a;bc'"));
+    }
+
+    #[test]
+    fn parse_scope_and_actions_works() {
+        let db_scope = parse_rbac_scope_token("db:app").unwrap();
+        assert!(matches!(
+            db_scope,
+            RbacScope::Database { database } if database == "app"
+        ));
+        let table_scope = parse_rbac_scope_token("table:app.users").unwrap();
+        assert!(matches!(
+            table_scope,
+            RbacScope::Table { database, table } if database == "app" && table == "users"
+        ));
+
+        let actions = parse_actions_csv("select,write").unwrap();
+        assert!(actions.contains(&RbacAction::Select));
+        assert!(actions.contains(&RbacAction::Insert));
+        assert!(actions.contains(&RbacAction::Update));
+        assert!(actions.contains(&RbacAction::Delete));
+    }
+
+    #[test]
+    fn upsert_grant_merges_actions() {
+        let mut user = RbacUser {
+            username: "alice".to_string(),
+            token: "t1".to_string(),
+            grants: Vec::new(),
+        };
+        let mut select = HashSet::new();
+        select.insert(RbacAction::Select);
+        let mut insert = HashSet::new();
+        insert.insert(RbacAction::Insert);
+        let scope = RbacScope::Table {
+            database: "app".to_string(),
+            table: "users".to_string(),
+        };
+
+        upsert_user_grant(&mut user, scope.clone(), select);
+        upsert_user_grant(&mut user, scope, insert);
+        assert_eq!(user.grants.len(), 1);
+        let actions = &user.grants[0].actions;
+        assert!(actions.contains(&RbacAction::Select));
+        assert!(actions.contains(&RbacAction::Insert));
+    }
+
+    #[test]
+    fn permission_requirements_follow_use_database() {
+        let statements = vec![
+            parse_sql("USE app").unwrap(),
+            parse_sql("SELECT * FROM users").unwrap(),
+            parse_sql("UPDATE users SET id = 1 WHERE id = 2").unwrap(),
+        ];
+        let requirements = permission_requirements_for_statements(&statements, "default").unwrap();
+        assert!(requirements.iter().any(|item| {
+            item.action == RbacAction::Select && item.database == "app" && item.table.is_none()
+        }));
+        assert!(requirements.iter().any(|item| {
+            item.action == RbacAction::Select
+                && item.database == "app"
+                && item.table.as_deref() == Some("users")
+        }));
+        assert!(requirements.iter().any(|item| {
+            item.action == RbacAction::Update
+                && item.database == "app"
+                && item.table.as_deref() == Some("users")
+        }));
+    }
+
+    #[test]
+    fn missing_requirement_detected() {
+        let user = AuthenticatedUser {
+            username: "bob".to_string(),
+            grants: vec![RbacGrant {
+                scope: RbacScope::Database {
+                    database: "app".to_string(),
+                },
+                actions: [RbacAction::Select].into_iter().collect(),
+            }],
+        };
+        let requirements = vec![
+            PermissionRequirement {
+                action: RbacAction::Select,
+                database: "app".to_string(),
+                table: Some("users".to_string()),
+            },
+            PermissionRequirement {
+                action: RbacAction::Delete,
+                database: "app".to_string(),
+                table: Some("users".to_string()),
+            },
+        ];
+        let missing = first_missing_requirement(&user, &requirements).unwrap();
+        assert_eq!(missing.action, RbacAction::Delete);
+    }
 }
