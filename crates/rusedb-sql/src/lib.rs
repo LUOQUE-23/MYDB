@@ -3,8 +3,9 @@ mod lexer;
 mod parser;
 
 pub use ast::{
-    AggregateFunction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem,
-    ReferenceDef, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp,
+    AggregateFunction, AlterColumnAction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause,
+    JoinType, Literal, OrderByItem, ReferenceDef, SelectItem, Statement, TableConstraint,
+    TableConstraintKind, UnaryOp,
 };
 pub use lexer::{Keyword, Span, Token, TokenKind};
 pub use parser::parse_sql;
@@ -14,8 +15,9 @@ mod tests {
     use rusedb_core::DataType;
 
     use crate::{
-        AggregateFunction, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem, SelectItem,
-        Statement, TableConstraint, TableConstraintKind, UnaryOp, parse_sql,
+        AggregateFunction, AlterColumnAction, BinaryOp, ColumnDef, Expr, JoinClause, JoinType,
+        Literal, OrderByItem, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp,
+        parse_sql,
     };
 
     #[test]
@@ -183,6 +185,7 @@ mod tests {
                     })
                 }),
                 group_by: vec![],
+                having: None,
                 order_by: vec![],
                 limit: None,
             }
@@ -221,6 +224,7 @@ mod tests {
                     })
                 }),
                 group_by: vec![],
+                having: None,
                 order_by: vec![],
                 limit: None,
             }
@@ -248,6 +252,7 @@ mod tests {
                     right: Box::new(Expr::Literal(Literal::Bool(true))),
                 }),
                 group_by: vec![],
+                having: None,
                 order_by: vec![
                     OrderByItem {
                         column: "name".to_string(),
@@ -274,6 +279,7 @@ mod tests {
             Statement::Select {
                 table: "users".to_string(),
                 joins: vec![JoinClause {
+                    kind: JoinType::Inner,
                     table: "orders".to_string(),
                     on: Expr::Binary {
                         left: Box::new(Expr::Identifier("users.id".to_string())),
@@ -290,10 +296,87 @@ mod tests {
                 ],
                 selection: None,
                 group_by: vec!["users.id".to_string()],
+                having: None,
                 order_by: vec![],
                 limit: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_predicate_extensions_and_left_join_having() {
+        let stmt = parse_sql(
+            "SELECT * FROM users WHERE name LIKE 'a%' AND id IN (1, 2, 3) AND score BETWEEN 10 AND 20 AND deleted_at IS NULL",
+        )
+        .unwrap();
+        assert!(matches!(stmt, Statement::Select { .. }));
+
+        let stmt = parse_sql(
+            "SELECT users.id, COUNT(*) FROM users LEFT JOIN orders ON users.id = orders.user_id GROUP BY users.id HAVING COUNT(*) > 1",
+        )
+        .unwrap();
+        assert_eq!(
+            stmt,
+            Statement::Select {
+                table: "users".to_string(),
+                joins: vec![JoinClause {
+                    kind: JoinType::Left,
+                    table: "orders".to_string(),
+                    on: Expr::Binary {
+                        left: Box::new(Expr::Identifier("users.id".to_string())),
+                        op: BinaryOp::Eq,
+                        right: Box::new(Expr::Identifier("orders.user_id".to_string())),
+                    },
+                }],
+                projection: vec![
+                    SelectItem::Column("users.id".to_string()),
+                    SelectItem::Aggregate {
+                        func: AggregateFunction::Count,
+                        column: None,
+                    },
+                ],
+                selection: None,
+                group_by: vec!["users.id".to_string()],
+                having: Some(Expr::Binary {
+                    left: Box::new(Expr::Aggregate {
+                        func: AggregateFunction::Count,
+                        column: None,
+                    }),
+                    op: BinaryOp::Gt,
+                    right: Box::new(Expr::Literal(Literal::Integer(1))),
+                }),
+                order_by: vec![],
+                limit: None,
+            }
+        );
+
+        let stmt = parse_sql(
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount >= 10)",
+        )
+        .unwrap();
+        assert!(matches!(
+            stmt,
+            Statement::Select {
+                selection: Some(Expr::InSubquery { .. }),
+                ..
+            }
+        ));
+
+        let stmt = parse_sql(
+            "SELECT id FROM users WHERE id = (SELECT user_id FROM orders WHERE amount >= 10)",
+        )
+        .unwrap();
+        assert!(matches!(
+            stmt,
+            Statement::Select {
+                selection: Some(Expr::Binary {
+                    right,
+                    op: BinaryOp::Eq,
+                    ..
+                }),
+                ..
+            } if matches!(*right, Expr::ScalarSubquery { .. })
+        ));
     }
 
     #[test]
@@ -343,6 +426,105 @@ mod tests {
             parse_sql("DROP TABLE users").unwrap(),
             Statement::DropTable {
                 name: "users".to_string()
+            }
+        );
+        assert_eq!(
+            parse_sql("ANALYZE TABLE users").unwrap(),
+            Statement::AnalyzeTable {
+                table: "users".to_string()
+            }
+        );
+        assert!(matches!(
+            parse_sql("EXPLAIN SELECT id FROM users").unwrap(),
+            Statement::Explain { analyze: false, .. }
+        ));
+        assert!(matches!(
+            parse_sql("EXPLAIN ANALYZE SELECT id FROM users").unwrap(),
+            Statement::Explain { analyze: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_alter_and_rename_statements() {
+        assert_eq!(
+            parse_sql("ALTER TABLE users ADD COLUMN age BIGINT").unwrap(),
+            Statement::AlterTableAddColumn {
+                table: "users".to_string(),
+                column: ColumnDef {
+                    name: "age".to_string(),
+                    data_type: DataType::BigInt,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    references: None,
+                },
+            }
+        );
+
+        assert_eq!(
+            parse_sql("ALTER TABLE users DROP COLUMN age").unwrap(),
+            Statement::AlterTableDropColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age TYPE DOUBLE").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::SetDataType(DataType::Double),
+            }
+        );
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age SET DATA TYPE BIGINT").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::SetDataType(DataType::BigInt),
+            }
+        );
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age SET NOT NULL").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::SetNotNull,
+            }
+        );
+        assert_eq!(
+            parse_sql("ALTER TABLE users ALTER COLUMN age DROP NOT NULL").unwrap(),
+            Statement::AlterTableAlterColumn {
+                table: "users".to_string(),
+                column: "age".to_string(),
+                action: AlterColumnAction::DropNotNull,
+            }
+        );
+
+        assert_eq!(
+            parse_sql("RENAME TABLE users TO app_users").unwrap(),
+            Statement::RenameTable {
+                old_name: "users".to_string(),
+                new_name: "app_users".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse_sql("RENAME COLUMN users.name TO full_name").unwrap(),
+            Statement::RenameColumn {
+                table: "users".to_string(),
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse_sql("RENAME COLUMN users name TO full_name").unwrap(),
+            Statement::RenameColumn {
+                table: "users".to_string(),
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
             }
         );
     }

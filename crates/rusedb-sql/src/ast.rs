@@ -2,6 +2,13 @@ use rusedb_core::DataType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    Explain {
+        analyze: bool,
+        statement: Box<Statement>,
+    },
+    AnalyzeTable {
+        table: String,
+    },
     Begin,
     Commit,
     Rollback,
@@ -19,6 +26,28 @@ pub enum Statement {
     ShowTables,
     DropTable {
         name: String,
+    },
+    AlterTableAddColumn {
+        table: String,
+        column: ColumnDef,
+    },
+    AlterTableDropColumn {
+        table: String,
+        column: String,
+    },
+    AlterTableAlterColumn {
+        table: String,
+        column: String,
+        action: AlterColumnAction,
+    },
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
+    RenameColumn {
+        table: String,
+        old_name: String,
+        new_name: String,
     },
     CreateTable {
         name: String,
@@ -41,6 +70,7 @@ pub enum Statement {
         projection: Vec<SelectItem>,
         selection: Option<Expr>,
         group_by: Vec<String>,
+        having: Option<Expr>,
         order_by: Vec<OrderByItem>,
         limit: Option<usize>,
     },
@@ -53,6 +83,13 @@ pub enum Statement {
         assignments: Vec<Assignment>,
         selection: Option<Expr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterColumnAction {
+    SetDataType(DataType),
+    SetNotNull,
+    DropNotNull,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,8 +145,15 @@ pub enum AggregateFunction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinClause {
+    pub kind: JoinType,
     pub table: String,
     pub on: Expr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +171,10 @@ pub struct Assignment {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Identifier(String),
+    Aggregate {
+        func: AggregateFunction,
+        column: Option<String>,
+    },
     Literal(Literal),
     Binary {
         left: Box<Expr>,
@@ -136,6 +184,34 @@ pub enum Expr {
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
+    },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<Statement>,
+        negated: bool,
+    },
+    ScalarSubquery {
+        subquery: Box<Statement>,
+    },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
     },
 }
 

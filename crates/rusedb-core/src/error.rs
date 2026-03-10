@@ -38,41 +38,61 @@ pub enum RuseDbError {
     },
 }
 
+impl RuseDbError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "RDB-IO-001",
+            Self::Corruption(_) => "RDB-CORRUPTION-001",
+            Self::InvalidSchema(_) => "RDB-SCHEMA-001",
+            Self::Parse(_) => "RDB-PARSE-001",
+            Self::TypeMismatch { .. } => "RDB-TYPE-001",
+            Self::NullConstraintViolation { .. } => "RDB-NULL-001",
+            Self::AlreadyExists { .. } => "RDB-EXISTS-001",
+            Self::NotFound { .. } => "RDB-NOTFOUND-001",
+            Self::RecordTooLarge { .. } => "RDB-RECORD-001",
+            Self::PageFull { .. } | Self::PageOutOfRange { .. } | Self::InvalidRid { .. } => {
+                "RDB-PAGE-001"
+            }
+        }
+    }
+}
+
 impl Display for RuseDbError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let code = self.code();
         match self {
-            Self::Io(err) => write!(f, "io error: {err}"),
-            Self::Corruption(msg) => write!(f, "corrupted page layout: {msg}"),
-            Self::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
-            Self::Parse(msg) => write!(f, "parse error: {msg}"),
+            Self::Io(err) => write!(f, "[{code}] io error: {err}"),
+            Self::Corruption(msg) => write!(f, "[{code}] corrupted page layout: {msg}"),
+            Self::InvalidSchema(msg) => write!(f, "[{code}] invalid schema: {msg}"),
+            Self::Parse(msg) => write!(f, "[{code}] parse error: {msg}"),
             Self::TypeMismatch {
                 column,
                 expected,
                 actual,
             } => write!(
                 f,
-                "type mismatch on column '{column}': expected {expected}, got {actual}"
+                "[{code}] type mismatch on column '{column}': expected {expected}, got {actual}"
             ),
             Self::NullConstraintViolation { column } => {
-                write!(f, "column '{column}' does not allow NULL")
+                write!(f, "[{code}] column '{column}' does not allow NULL")
             }
             Self::AlreadyExists { object, name } => {
-                write!(f, "{object} '{name}' already exists")
+                write!(f, "[{code}] {object} '{name}' already exists")
             }
-            Self::NotFound { object, name } => write!(f, "{object} '{name}' not found"),
-            Self::RecordTooLarge { size } => write!(f, "record too large: {size} bytes"),
+            Self::NotFound { object, name } => write!(f, "[{code}] {object} '{name}' not found"),
+            Self::RecordTooLarge { size } => write!(f, "[{code}] record too large: {size} bytes"),
             Self::PageFull { page_id } => {
-                write!(f, "page {page_id} does not have enough free space")
+                write!(f, "[{code}] page {page_id} does not have enough free space")
             }
             Self::PageOutOfRange {
                 page_id,
                 page_count,
             } => write!(
                 f,
-                "page id out of range: requested={page_id}, page_count={page_count}"
+                "[{code}] page id out of range: requested={page_id}, page_count={page_count}"
             ),
             Self::InvalidRid { page_id, slot_id } => {
-                write!(f, "invalid rid: page={page_id}, slot={slot_id}")
+                write!(f, "[{code}] invalid rid: page={page_id}, slot={slot_id}")
             }
         }
     }

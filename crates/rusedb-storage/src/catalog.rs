@@ -337,6 +337,279 @@ impl Catalog {
         Ok(info)
     }
 
+    pub fn add_column(&mut self, table_name: &str, column: Column) -> Result<ColumnInfo> {
+        let table = self.get_table(table_name)?;
+        let column_name = column.name.trim();
+        if column_name.is_empty() {
+            return Err(RuseDbError::InvalidSchema(
+                "column name cannot be empty".to_string(),
+            ));
+        }
+
+        let normalized = normalize_name(column_name);
+        if self
+            .columns_by_table
+            .get(&table.table_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| normalize_name(&entry.info.name) == normalized)
+            })
+            .unwrap_or(false)
+        {
+            return Err(RuseDbError::AlreadyExists {
+                object: "column".to_string(),
+                name: column_name.to_string(),
+            });
+        }
+
+        let column_id = self.next_column_id;
+        self.next_column_id += 1;
+        let info = ColumnInfo {
+            table_id: table.table_id,
+            column_id,
+            name: column_name.to_string(),
+            data_type: column.data_type,
+            nullable: column.nullable,
+        };
+        let rid = self
+            .columns_heap
+            .insert_record(&encode_column_row(&info).encode(&columns_schema())?)?;
+        self.columns_heap.sync()?;
+        self.columns_by_table
+            .entry(table.table_id)
+            .or_default()
+            .push(ColumnEntry {
+                rid,
+                info: info.clone(),
+            });
+        Ok(info)
+    }
+
+    pub fn drop_column(&mut self, table_name: &str, column_name: &str) -> Result<ColumnInfo> {
+        let table = self.get_table(table_name)?;
+        let entries =
+            self.columns_by_table
+                .get_mut(&table.table_id)
+                .ok_or(RuseDbError::Corruption(format!(
+                    "table '{}' has no column metadata",
+                    table_name
+                )))?;
+        if entries.len() <= 1 {
+            return Err(RuseDbError::InvalidSchema(format!(
+                "cannot drop last column from table '{}'",
+                table_name
+            )));
+        }
+
+        let normalized = normalize_name(column_name);
+        let idx = entries
+            .iter()
+            .position(|entry| normalize_name(&entry.info.name) == normalized)
+            .ok_or(RuseDbError::NotFound {
+                object: "column".to_string(),
+                name: column_name.to_string(),
+            })?;
+        let entry = entries.remove(idx);
+        self.columns_heap.delete_record(entry.rid)?;
+        self.columns_heap.sync()?;
+        Ok(entry.info)
+    }
+
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<TableInfo> {
+        let old_normalized = normalize_name(old_name);
+        let new_name_trimmed = new_name.trim();
+        let new_normalized = normalize_name(new_name_trimmed);
+        if new_normalized.is_empty() {
+            return Err(RuseDbError::InvalidSchema(
+                "table name cannot be empty".to_string(),
+            ));
+        }
+
+        let table_id =
+            self.table_name_to_id
+                .get(&old_normalized)
+                .copied()
+                .ok_or(RuseDbError::NotFound {
+                    object: "table".to_string(),
+                    name: old_name.to_string(),
+                })?;
+        if old_normalized != new_normalized && self.table_name_to_id.contains_key(&new_normalized) {
+            return Err(RuseDbError::AlreadyExists {
+                object: "table".to_string(),
+                name: new_name_trimmed.to_string(),
+            });
+        }
+
+        self.table_name_to_id.remove(&old_normalized);
+        self.table_name_to_id.insert(new_normalized, table_id);
+
+        let entry = self
+            .tables
+            .get_mut(&table_id)
+            .ok_or(RuseDbError::Corruption(format!(
+                "table id {} missing metadata",
+                table_id
+            )))?;
+        entry.info.name = new_name_trimmed.to_string();
+        entry.rid = self.tables_heap.update_record(
+            entry.rid,
+            &encode_table_row(&entry.info).encode(&tables_schema())?,
+        )?;
+
+        let renamed_table = entry.info.name.clone();
+        for entries in self.constraints_by_table.values_mut() {
+            for constraint in entries.iter_mut() {
+                if let Some(referenced_table) = constraint.info.referenced_table.as_ref()
+                    && normalize_name(referenced_table) == old_normalized
+                {
+                    constraint.info.referenced_table = Some(renamed_table.clone());
+                    constraint.rid = self.constraints_heap.update_record(
+                        constraint.rid,
+                        &encode_constraint_row(&constraint.info)?.encode(&constraints_schema())?,
+                    )?;
+                }
+            }
+        }
+
+        self.tables_heap.sync()?;
+        self.constraints_heap.sync()?;
+        Ok(entry.info.clone())
+    }
+
+    pub fn rename_column(
+        &mut self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<ColumnInfo> {
+        let table = self.get_table(table_name)?;
+        let table_name_actual = table.name.clone();
+        let table_normalized = normalize_name(&table_name_actual);
+        let old_normalized = normalize_name(old_name);
+        let new_name_trimmed = new_name.trim();
+        let new_normalized = normalize_name(new_name_trimmed);
+        if new_normalized.is_empty() {
+            return Err(RuseDbError::InvalidSchema(
+                "column name cannot be empty".to_string(),
+            ));
+        }
+
+        let columns =
+            self.columns_by_table
+                .get_mut(&table.table_id)
+                .ok_or(RuseDbError::Corruption(format!(
+                    "table '{}' has no column metadata",
+                    table_name
+                )))?;
+        let old_idx = columns
+            .iter()
+            .position(|entry| normalize_name(&entry.info.name) == old_normalized)
+            .ok_or(RuseDbError::NotFound {
+                object: "column".to_string(),
+                name: old_name.to_string(),
+            })?;
+        if old_normalized != new_normalized
+            && columns
+                .iter()
+                .any(|entry| normalize_name(&entry.info.name) == new_normalized)
+        {
+            return Err(RuseDbError::AlreadyExists {
+                object: "column".to_string(),
+                name: new_name_trimmed.to_string(),
+            });
+        }
+
+        columns[old_idx].info.name = new_name_trimmed.to_string();
+        columns[old_idx].rid = self.columns_heap.update_record(
+            columns[old_idx].rid,
+            &encode_column_row(&columns[old_idx].info).encode(&columns_schema())?,
+        )?;
+
+        if let Some(indexes) = self.indexes_by_table.get_mut(&table.table_id) {
+            for index in indexes.iter_mut() {
+                if normalize_name(&index.info.key_columns) == old_normalized {
+                    index.info.key_columns = new_name_trimmed.to_string();
+                    index.rid = self.indexes_heap.update_record(
+                        index.rid,
+                        &encode_index_row(&index.info).encode(&indexes_schema())?,
+                    )?;
+                }
+            }
+        }
+
+        for constraints in self.constraints_by_table.values_mut() {
+            for constraint in constraints.iter_mut() {
+                let mut changed = false;
+                if constraint.info.table_id == table.table_id {
+                    changed |= rename_in_column_list(
+                        &mut constraint.info.key_columns,
+                        &old_normalized,
+                        new_name_trimmed,
+                    );
+                }
+                if let Some(referenced_table) = constraint.info.referenced_table.as_ref()
+                    && normalize_name(referenced_table) == table_normalized
+                {
+                    changed |= rename_in_column_list(
+                        &mut constraint.info.referenced_columns,
+                        &old_normalized,
+                        new_name_trimmed,
+                    );
+                }
+                if changed {
+                    constraint.rid = self.constraints_heap.update_record(
+                        constraint.rid,
+                        &encode_constraint_row(&constraint.info)?.encode(&constraints_schema())?,
+                    )?;
+                }
+            }
+        }
+
+        self.columns_heap.sync()?;
+        self.indexes_heap.sync()?;
+        self.constraints_heap.sync()?;
+        Ok(columns[old_idx].info.clone())
+    }
+
+    pub fn alter_column(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        data_type: Option<DataType>,
+        nullable: Option<bool>,
+    ) -> Result<ColumnInfo> {
+        let table = self.get_table(table_name)?;
+        let columns =
+            self.columns_by_table
+                .get_mut(&table.table_id)
+                .ok_or(RuseDbError::Corruption(format!(
+                    "table '{}' has no column metadata",
+                    table_name
+                )))?;
+        let target_idx = columns
+            .iter()
+            .position(|entry| normalize_name(&entry.info.name) == normalize_name(column_name))
+            .ok_or(RuseDbError::NotFound {
+                object: "column".to_string(),
+                name: column_name.to_string(),
+            })?;
+
+        if let Some(dt) = data_type {
+            columns[target_idx].info.data_type = dt;
+        }
+        if let Some(is_nullable) = nullable {
+            columns[target_idx].info.nullable = is_nullable;
+        }
+
+        columns[target_idx].rid = self.columns_heap.update_record(
+            columns[target_idx].rid,
+            &encode_column_row(&columns[target_idx].info).encode(&columns_schema())?,
+        )?;
+        self.columns_heap.sync()?;
+        Ok(columns[target_idx].info.clone())
+    }
+
     pub fn list_tables(&self) -> Vec<TableInfo> {
         self.tables
             .values()
@@ -774,6 +1047,42 @@ fn path_with_suffix(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
+fn encode_table_row(info: &TableInfo) -> Row {
+    Row::new(vec![
+        Value::BigInt(i64::from(info.table_id)),
+        Value::Varchar(info.name.clone()),
+    ])
+}
+
+fn encode_column_row(info: &ColumnInfo) -> Row {
+    Row::new(vec![
+        Value::BigInt(i64::from(info.column_id)),
+        Value::BigInt(i64::from(info.table_id)),
+        Value::Varchar(info.name.clone()),
+        Value::Varchar(info.data_type.as_str().to_string()),
+        Value::Bool(info.nullable),
+    ])
+}
+
+fn encode_index_row(info: &IndexInfo) -> Row {
+    Row::new(vec![
+        Value::BigInt(i64::from(info.index_id)),
+        Value::BigInt(i64::from(info.table_id)),
+        Value::Varchar(info.name.clone()),
+        Value::Varchar(info.key_columns.clone()),
+    ])
+}
+
+fn encode_constraint_row(info: &ConstraintInfo) -> Result<Row> {
+    Ok(Row::new(vec![
+        Value::BigInt(i64::from(info.constraint_id)),
+        Value::BigInt(i64::from(info.table_id)),
+        Value::Varchar(info.name.clone()),
+        Value::Varchar(info.kind.as_str().to_string()),
+        Value::Varchar(encode_constraint_payload(info)?),
+    ]))
+}
+
 fn encode_constraint_payload(info: &ConstraintInfo) -> Result<String> {
     match info.kind {
         ConstraintKind::PrimaryKey | ConstraintKind::Unique => Ok(info.key_columns.join(",")),
@@ -855,6 +1164,17 @@ fn split_column_list(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn rename_in_column_list(columns: &mut [String], old_normalized: &str, new_name: &str) -> bool {
+    let mut changed = false;
+    for column in columns.iter_mut() {
+        if normalize_name(column) == old_normalized {
+            *column = new_name.to_string();
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn value_as_u32(value: &Value, column_name: &str) -> Result<u32> {

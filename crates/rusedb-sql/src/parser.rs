@@ -1,8 +1,9 @@
 use rusedb_core::{DataType, Result, RuseDbError};
 
 use crate::ast::{
-    AggregateFunction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause, Literal, OrderByItem,
-    ReferenceDef, SelectItem, Statement, TableConstraint, TableConstraintKind, UnaryOp,
+    AggregateFunction, AlterColumnAction, Assignment, BinaryOp, ColumnDef, Expr, JoinClause,
+    JoinType, Literal, OrderByItem, ReferenceDef, SelectItem, Statement, TableConstraint,
+    TableConstraintKind, UnaryOp,
 };
 use crate::lexer::{Keyword, Token, TokenKind, lex, parse_error};
 
@@ -28,35 +29,60 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Statement> {
-        let stmt = match self.peek_keyword() {
-            Some(Keyword::Begin) => {
-                self.expect_keyword(Keyword::Begin)?;
-                Statement::Begin
-            }
-            Some(Keyword::Commit) => {
-                self.expect_keyword(Keyword::Commit)?;
-                Statement::Commit
-            }
-            Some(Keyword::Rollback) => {
-                self.expect_keyword(Keyword::Rollback)?;
-                Statement::Rollback
-            }
-            Some(Keyword::Use) => self.parse_use()?,
-            Some(Keyword::Show) => self.parse_show()?,
-            Some(Keyword::Create) => self.parse_create()?,
-            Some(Keyword::Drop) => self.parse_drop()?,
-            Some(Keyword::Insert) => self.parse_insert()?,
-            Some(Keyword::Select) => self.parse_select()?,
-            Some(Keyword::Delete) => self.parse_delete()?,
-            Some(Keyword::Update) => self.parse_update()?,
-            _ => return Err(self.error_here("expected SQL statement")),
-        };
+        let stmt = self.parse_statement_core()?;
 
         self.consume_kind(&TokenKind::Semicolon);
         if self.peek().is_some() {
             return Err(self.error_here("unexpected token after statement"));
         }
         Ok(stmt)
+    }
+
+    fn parse_statement_core(&mut self) -> Result<Statement> {
+        match self.peek_keyword() {
+            Some(Keyword::Explain) => self.parse_explain(),
+            Some(Keyword::Analyze) => self.parse_analyze(),
+            Some(Keyword::Begin) => {
+                self.expect_keyword(Keyword::Begin)?;
+                Ok(Statement::Begin)
+            }
+            Some(Keyword::Commit) => {
+                self.expect_keyword(Keyword::Commit)?;
+                Ok(Statement::Commit)
+            }
+            Some(Keyword::Rollback) => {
+                self.expect_keyword(Keyword::Rollback)?;
+                Ok(Statement::Rollback)
+            }
+            Some(Keyword::Use) => self.parse_use(),
+            Some(Keyword::Show) => self.parse_show(),
+            Some(Keyword::Create) => self.parse_create(),
+            Some(Keyword::Drop) => self.parse_drop(),
+            Some(Keyword::Alter) => self.parse_alter(),
+            Some(Keyword::Rename) => self.parse_rename(),
+            Some(Keyword::Insert) => self.parse_insert(),
+            Some(Keyword::Select) => self.parse_select(),
+            Some(Keyword::Delete) => self.parse_delete(),
+            Some(Keyword::Update) => self.parse_update(),
+            _ => Err(self.error_here("expected SQL statement")),
+        }
+    }
+
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Explain)?;
+        let analyze = self.consume_keyword(Keyword::Analyze);
+        let statement = self.parse_statement_core()?;
+        Ok(Statement::Explain {
+            analyze,
+            statement: Box::new(statement),
+        })
+    }
+
+    fn parse_analyze(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Analyze)?;
+        self.expect_keyword(Keyword::Table)?;
+        let table = self.parse_identifier_path()?;
+        Ok(Statement::AnalyzeTable { table })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -76,6 +102,87 @@ impl<'a> Parser<'a> {
             Some(Keyword::Table) => self.parse_drop_table(),
             _ => Err(self.error_here("expected DATABASE or TABLE after DROP")),
         }
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let table = self.parse_identifier_path()?;
+
+        if self.consume_keyword(Keyword::Add) {
+            self.expect_keyword(Keyword::Column)?;
+            let column = self.parse_column_def()?;
+            return Ok(Statement::AlterTableAddColumn { table, column });
+        }
+
+        if self.consume_keyword(Keyword::Drop) {
+            self.expect_keyword(Keyword::Column)?;
+            let column = self.parse_identifier_path_segment()?;
+            return Ok(Statement::AlterTableDropColumn { table, column });
+        }
+
+        if self.consume_keyword(Keyword::Alter) {
+            self.expect_keyword(Keyword::Column)?;
+            let column = self.parse_identifier_path_segment()?;
+            let action = if self.consume_identifier_ci("TYPE") {
+                let type_name = self.parse_type_name()?;
+                AlterColumnAction::SetDataType(type_name.parse()?)
+            } else if self.consume_keyword(Keyword::Set) {
+                if self.consume_identifier_ci("DATA") {
+                    self.expect_identifier_ci("TYPE")?;
+                    let type_name = self.parse_type_name()?;
+                    AlterColumnAction::SetDataType(type_name.parse()?)
+                } else {
+                    self.expect_keyword(Keyword::Not)?;
+                    self.expect_keyword(Keyword::Null)?;
+                    AlterColumnAction::SetNotNull
+                }
+            } else if self.consume_keyword(Keyword::Drop) {
+                self.expect_keyword(Keyword::Not)?;
+                self.expect_keyword(Keyword::Null)?;
+                AlterColumnAction::DropNotNull
+            } else {
+                return Err(self.error_here(
+                    "expected TYPE, SET [DATA] TYPE, SET NOT NULL or DROP NOT NULL after ALTER COLUMN",
+                ));
+            };
+            return Ok(Statement::AlterTableAlterColumn {
+                table,
+                column,
+                action,
+            });
+        }
+
+        Err(self.error_here("expected ADD COLUMN, DROP COLUMN or ALTER COLUMN after ALTER TABLE"))
+    }
+
+    fn parse_rename(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Rename)?;
+        if self.consume_keyword(Keyword::Table) {
+            let old_name = self.parse_identifier_path()?;
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_identifier_path()?;
+            return Ok(Statement::RenameTable { old_name, new_name });
+        }
+        if self.consume_keyword(Keyword::Column) {
+            let first = self.parse_identifier_path()?;
+            let (table, old_name) = if self.peek_keyword() == Some(Keyword::To) {
+                split_qualified_column(&first)
+                    .ok_or_else(|| self.error_here("expected qualified name <table>.<column>"))?
+            } else {
+                let old_name = self.parse_identifier_path_segment()?;
+                (first, old_name)
+            };
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_identifier_path_segment()?;
+            return Ok(Statement::RenameColumn {
+                table,
+                old_name,
+                new_name,
+            });
+        }
+
+        Err(self.error_here("expected TABLE or COLUMN after RENAME"))
     }
 
     fn parse_create_database(&mut self) -> Result<Statement> {
@@ -229,11 +336,21 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let table = self.parse_identifier_path()?;
         let mut joins = Vec::new();
-        while self.consume_keyword(Keyword::Join) {
+        while self.peek_keyword() == Some(Keyword::Join)
+            || self.peek_keyword() == Some(Keyword::Left)
+        {
+            let kind = if self.consume_keyword(Keyword::Left) {
+                self.expect_keyword(Keyword::Join)?;
+                JoinType::Left
+            } else {
+                self.expect_keyword(Keyword::Join)?;
+                JoinType::Inner
+            };
             let join_table = self.parse_identifier_path()?;
             self.expect_keyword(Keyword::On)?;
             let on = self.parse_expr()?;
             joins.push(JoinClause {
+                kind,
                 table: join_table,
                 on,
             });
@@ -248,6 +365,11 @@ impl<'a> Parser<'a> {
             self.parse_group_by_items()?
         } else {
             Vec::new()
+        };
+        let having = if self.consume_keyword(Keyword::Having) {
+            Some(self.parse_expr()?)
+        } else {
+            None
         };
         let order_by = if self.consume_keyword(Keyword::Order) {
             self.expect_keyword(Keyword::By)?;
@@ -267,6 +389,7 @@ impl<'a> Parser<'a> {
             projection,
             selection,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -479,13 +602,69 @@ impl<'a> Parser<'a> {
 
     fn parse_comparison(&mut self) -> Result<Expr> {
         let mut left = self.parse_unary()?;
-        while let Some(op) = self.try_comparison_op() {
-            let right = self.parse_unary()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+        loop {
+            if let Some(op) = self.try_comparison_op() {
+                let right = self.parse_unary()?;
+                left = Expr::Binary {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+                continue;
+            }
+
+            if self.consume_keyword(Keyword::Is) {
+                let negated = self.consume_keyword(Keyword::Not);
+                self.expect_keyword(Keyword::Null)?;
+                left = Expr::IsNull {
+                    expr: Box::new(left),
+                    negated,
+                };
+                continue;
+            }
+
+            if self.consume_keyword(Keyword::Not) {
+                if self.consume_keyword(Keyword::In) {
+                    left = self.parse_in_list(left, true)?;
+                    continue;
+                }
+                if self.consume_keyword(Keyword::Like) {
+                    let pattern = self.parse_unary()?;
+                    left = Expr::Like {
+                        expr: Box::new(left),
+                        pattern: Box::new(pattern),
+                        negated: true,
+                    };
+                    continue;
+                }
+                if self.consume_keyword(Keyword::Between) {
+                    left = self.parse_between(left, true)?;
+                    continue;
+                }
+                return Err(self.error_here("expected IN, LIKE or BETWEEN after NOT"));
+            }
+
+            if self.consume_keyword(Keyword::In) {
+                left = self.parse_in_list(left, false)?;
+                continue;
+            }
+
+            if self.consume_keyword(Keyword::Like) {
+                let pattern = self.parse_unary()?;
+                left = Expr::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(pattern),
+                    negated: false,
+                };
+                continue;
+            }
+
+            if self.consume_keyword(Keyword::Between) {
+                left = self.parse_between(left, false)?;
+                continue;
+            }
+
+            break;
         }
         Ok(left)
     }
@@ -512,6 +691,25 @@ impl<'a> Parser<'a> {
         let token = self.next().ok_or(self.error_here("expected expression"))?;
         match token.kind {
             TokenKind::Identifier(name) => {
+                if self.consume_kind(&TokenKind::LParen) {
+                    let func = parse_aggregate_function(&name).ok_or_else(|| {
+                        self.error_at(token.span.start, "unknown function in expression")
+                    })?;
+                    let column = if self.consume_kind(&TokenKind::Star) {
+                        if !matches!(func, AggregateFunction::Count) {
+                            return Err(self.error_at(
+                                token.span.start,
+                                "only COUNT supports wildcard argument",
+                            ));
+                        }
+                        None
+                    } else {
+                        Some(self.parse_identifier_path()?)
+                    };
+                    self.expect_kind(&TokenKind::RParen)?;
+                    return Ok(Expr::Aggregate { func, column });
+                }
+
                 let mut full = name;
                 while self.consume_kind(&TokenKind::Dot) {
                     let part = self.parse_identifier_path_segment()?;
@@ -526,7 +724,13 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::True) => Ok(Expr::Literal(Literal::Bool(true))),
             TokenKind::Keyword(Keyword::False) => Ok(Expr::Literal(Literal::Bool(false))),
             TokenKind::LParen => {
-                let expr = self.parse_expr()?;
+                let expr = if self.peek_keyword() == Some(Keyword::Select) {
+                    Expr::ScalarSubquery {
+                        subquery: Box::new(self.parse_select()?),
+                    }
+                } else {
+                    self.parse_expr()?
+                };
                 self.expect_kind(&TokenKind::RParen)?;
                 Ok(expr)
             }
@@ -535,6 +739,49 @@ impl<'a> Parser<'a> {
                 &format!("expected expression, got {other}"),
             )),
         }
+    }
+
+    fn parse_in_list(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
+        self.expect_kind(&TokenKind::LParen)?;
+        if self.peek_keyword() == Some(Keyword::Select) {
+            let subquery = self.parse_select()?;
+            self.expect_kind(&TokenKind::RParen)?;
+            return Ok(Expr::InSubquery {
+                expr: Box::new(expr),
+                subquery: Box::new(subquery),
+                negated,
+            });
+        }
+
+        let mut list = Vec::new();
+        loop {
+            list.push(self.parse_expr()?);
+            if self.consume_kind(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect_kind(&TokenKind::RParen)?;
+        if list.is_empty() {
+            return Err(self.error_here("IN list cannot be empty"));
+        }
+        Ok(Expr::InList {
+            expr: Box::new(expr),
+            list,
+            negated,
+        })
+    }
+
+    fn parse_between(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
+        let low = self.parse_unary()?;
+        self.expect_keyword(Keyword::And)?;
+        let high = self.parse_unary()?;
+        Ok(Expr::Between {
+            expr: Box::new(expr),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+        })
     }
 
     fn try_comparison_op(&mut self) -> Option<BinaryOp> {
@@ -706,6 +953,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn consume_identifier_ci(&mut self, expected: &str) -> bool {
+        let Some(token) = self.peek() else {
+            return false;
+        };
+        let TokenKind::Identifier(actual) = &token.kind else {
+            return false;
+        };
+        if actual.eq_ignore_ascii_case(expected) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_identifier_ci(&mut self, expected: &str) -> Result<()> {
+        if self.consume_identifier_ci(expected) {
+            Ok(())
+        } else {
+            Err(self.error_here(&format!("expected identifier {}", expected)))
+        }
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.cursor)
     }
@@ -759,4 +1029,14 @@ fn parse_aggregate_function(name: &str) -> Option<AggregateFunction> {
         "MAX" => Some(AggregateFunction::Max),
         _ => None,
     }
+}
+
+fn split_qualified_column(input: &str) -> Option<(String, String)> {
+    let idx = input.rfind('.')?;
+    let table = input[..idx].trim();
+    let column = input[idx + 1..].trim();
+    if table.is_empty() || column.is_empty() {
+        return None;
+    }
+    Some((table.to_string(), column.to_string()))
 }

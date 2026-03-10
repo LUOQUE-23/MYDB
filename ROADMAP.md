@@ -1,4 +1,4 @@
-# RuseDB Roadmap (V1.0.0)
+# RuseDB Roadmap (V1.0.1)
 
 This roadmap is derived from `prompt.docx` and tracks what is already implemented.
 
